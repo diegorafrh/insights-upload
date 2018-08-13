@@ -21,17 +21,3 @@ services:
     image: consumer:latest
     depends_on:
       - kafka
-  upload-service:
-    build: ../.
-    image: upload-service:latest
-    ports:
-      - 8080:8888
-    environment:
-      - AWS_ACCESS_KEY_ID
-      - AWS_SECRET_ACCESS_KEY
-      # set env variables if not using the default
-      #- S3_PERM
-      #- S3_REJECT
-      #- S3_QUARANTINE
-    depends_on:
-      - kafka

@@ -98,6 +98,10 @@ class TestS3:
 
 
 class TestLocalDisk:
+    
+    @staticmethod
+    def _get_file_data():
+        return os.urandom(100).decode('latin1').encode('utf-8').decode()
 
     @staticmethod
     def _get_file_data():

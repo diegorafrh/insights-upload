@@ -71,6 +71,12 @@ with open('VERSION', 'r') as f:
     VERSION = f.read()
 
 
+class BaseHandler(tornado.web.RequestHandler):
+    def __init__(self, *args, **kwargs):
+        super(BaseHandler, self).__init__(*args, **kwargs)
+        self.set_header('Access-Control-Allow-Origin', 'http://localhost:8899')
+
+
 def split_content(content):
     """Split the content-type to find the service name
 
@@ -189,7 +195,7 @@ async def handle_file(msgs):
             logger.info('Unrecognized result: ' + result.lower())
 
 
-class RootHandler(tornado.web.RequestHandler):
+class RootHandler(BaseHandler):
     """Handles requests to root
     """
 
@@ -204,7 +210,7 @@ class RootHandler(tornado.web.RequestHandler):
         self.add_header('Allow', 'GET, HEAD, OPTIONS')
 
 
-class UploadHandler(tornado.web.RequestHandler):
+class UploadHandler(BaseHandler):
     """Handles requests to the upload endpoint
     """
     def upload_validation(self):
@@ -382,7 +388,7 @@ class UploadHandler(tornado.web.RequestHandler):
         self.add_header('Allow', 'GET, POST, HEAD, OPTIONS')
 
 
-class VersionHandler(tornado.web.RequestHandler):
+class VersionHandler(BaseHandler):
     """Handler for the `version` endpoint
     """
 
@@ -393,7 +399,7 @@ class VersionHandler(tornado.web.RequestHandler):
         self.write(response)
 
 
-class StatusHandler(tornado.web.RequestHandler):
+class StatusHandler(BaseHandler):
 
     async def get(self):
 
@@ -422,7 +428,7 @@ endpoints = [
     (r"/", RootHandler),
     (r"/api/v1/version", VersionHandler),
     (r"/api/v1/upload", UploadHandler),
-    (r"/api/v1/status", StatusHandler),
+    (r"/api/v1/status", StatusHandler)
 ]
 
 app = tornado.web.Application(endpoints, max_body_size=MAX_LENGTH)

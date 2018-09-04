@@ -1,0 +1,147 @@
+{
+  "swagger": "2.0",
+  "info": {
+    "title": "Insights Upload Service",
+    "description": "The Upload Service is designed to ingest payloads from customers and distribute them via a message queue to other Platform services.",
+    "contact": {
+      "name": "Stephen Adams",
+      "email": "sadams@redhat.com"
+    },
+    "version": "0.0.1"
+  },
+  "host": "localhost:8888",
+  "tags": [
+    {
+      "name": "upload",
+      "description": "Deal with the file posted by insights-client"
+    },
+    {
+      "name": "status",
+      "description": "Application health-check"
+    },
+    {
+      "name": "base",
+      "description": "RootHandler"
+    },
+    {
+      "name": "version",
+      "description": "Application version"
+    }
+  ],
+  "schemes": [
+    "http"
+  ],
+  "paths": {
+    "/": {
+      "get": {
+        "tags": [
+          "base"
+        ],
+        "summary": "Checks if the application is running",
+        "description": "Return a simple string 'boop' to verify if the application is running",
+        "operationId": "RootHandler.get",
+        "produces": [
+          "text/html"
+        ],
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+
+    "/api/v1/version": {
+      "get": {
+        "tags": [
+          "version"
+        ],
+        "summary": "Get the application version",
+        "description": "Return the current application version",
+        "operationId": "VersionHandler.get",
+        "produces": [
+          "application/json"
+        ],
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+
+
+    "/api/v1/status": {
+      "get": {
+        "tags": [
+          "status"
+        ],
+        "summary": "Check if the application is online",
+        "description": "Return a json that shows which system/api is running (or not)",
+        "operationId": "StatusHandler.get",
+        "produces": [
+          "application/json"
+        ],
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+
+    "/api/v1/upload": {
+      "get": {
+        "tags": [
+          "upload"
+        ],
+        "summary": "Checks for content-types",
+        "description": "Return which content types are available",
+        "operationId": "UploadHandler.get",
+        "produces": [
+          "text/html"
+        ],
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      },
+
+      "post": {
+        "tags": [
+          "upload"
+        ],
+        "summary": "Send a file",
+        "description": "Send on file to be analyzed just like insights-client would do",
+        "operationId": "UploadHandler.post",
+        "consumes": [
+          "multipart/form-data"
+        ],
+        "produces": [
+          "text/html"
+        ],
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        },
+        "parameters": [
+          {
+            "name": "upload",
+            "in": "formData",
+            "description": "File to upload",
+            "required": true,
+            "type": "file"
+          },
+          {
+            "name": "content-type",
+            "default": "application/vnd.redhat.advisor.payload+tgz",
+            "in": "header",
+            "required": true
+          }
+        ]
+      }
+    }
+  }
+}

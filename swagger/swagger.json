@@ -38,7 +38,7 @@
           "base"
         ],
         "summary": "Checks if the application is running",
-        "description": "Return a simple string 'boop' to verify if the application is running",
+        "description": "Return a simple text 'boop' to verify if the application is running",
         "operationId": "RootHandler.get",
         "produces": [
           "text/html"
@@ -118,27 +118,19 @@
         "consumes": [
           "multipart/form-data"
         ],
-        "produces": [
-          "text/html"
-        ],
         "responses": {
           "200": {
             "description": "OK"
           }
         },
+
         "parameters": [
           {
             "name": "upload",
             "in": "formData",
-            "description": "File to upload",
+            "description": "Select the tar.gz file to upload. You may find a file example at PROJECT_PATH/swagger/payload.tar.gz",
             "required": true,
             "type": "file"
-          },
-          {
-            "name": "content-type",
-            "default": "application/vnd.redhat.advisor.payload+tgz",
-            "in": "header",
-            "required": true
           }
         ]
       }

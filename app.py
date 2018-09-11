@@ -424,11 +424,19 @@ class StatusHandler(BaseHandler):
         self.write(response)
 
 
+class SwaggerHandler(BaseHandler):
+
+    async def get(self):
+        with open('swagger/swagger.json') as swagger_file:
+            self.write(json.loads(swagger_file.read().strip()))
+
+
 endpoints = [
     (r"/", RootHandler),
     (r"/api/v1/version", VersionHandler),
     (r"/api/v1/upload", UploadHandler),
-    (r"/api/v1/status", StatusHandler)
+    (r"/api/v1/status", StatusHandler),
+    (r"/api/v1/swagger", SwaggerHandler)
 ]
 
 app = tornado.web.Application(endpoints, max_body_size=MAX_LENGTH)

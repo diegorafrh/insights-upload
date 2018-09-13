@@ -83,7 +83,6 @@ def no_local_folders():
         shutil.rmtree(_dir, ignore_errors=True)
 
 
-@responses.activate
 @pytest.fixture
 def influx_db_mock():
     # responses.reset()
@@ -97,7 +96,6 @@ def influx_db_mock():
     mnm.INFLUXDB_PLATFORM = os.getenv('INFLUXDB_PLATFORM')
 
 
-@responses.activate
 @pytest.fixture
 def influx_db_error_mock():
     # responses.reset()

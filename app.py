@@ -1,23 +1,21 @@
 import asyncio
+import base64
 import collections
 import json
 import logging
 import os
 import re
 import uuid
-import base64
-
 from concurrent.futures import ThreadPoolExecutor
 from importlib import import_module
 from tempfile import NamedTemporaryFile
 from time import sleep, time
 
-import tornado.ioloop
 import tornado.web
-from tornado.ioloop import IOLoop
-
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 from kafka.errors import KafkaError
+from tornado.ioloop import IOLoop
+
 from utils import mnm
 
 # Logging
@@ -75,13 +73,6 @@ thread_pool_executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 
 with open('VERSION', 'r') as f:
     VERSION = f.read()
-
-
-class BaseHandler(tornado.web.RequestHandler):
-    def __init__(self, *args, **kwargs):
-        super(BaseHandler, self).__init__(*args, **kwargs)
-        self.set_header('Access-Control-Allow-Origin', 'http://localhost:8899')
-
 
 def split_content(content):
     """Split the content-type to find the service name
@@ -216,7 +207,7 @@ async def handle_file(msgs):
             logger.info('Unrecognized result: %s', result.lower())
 
 
-class RootHandler(BaseHandler):
+class RootHandler(tornado.web.RequestHandler):
     """Handles requests to root
     """
 
@@ -231,7 +222,7 @@ class RootHandler(BaseHandler):
         self.add_header('Allow', 'GET, HEAD, OPTIONS')
 
 
-class UploadHandler(BaseHandler):
+class UploadHandler(tornado.web.RequestHandler):
     """Handles requests to the upload endpoint
     """
     def upload_validation(self):
@@ -409,7 +400,7 @@ class UploadHandler(BaseHandler):
         self.add_header('Allow', 'GET, POST, HEAD, OPTIONS')
 
 
-class VersionHandler(BaseHandler):
+class VersionHandler(tornado.web.RequestHandler):
     """Handler for the `version` endpoint
     """
 
@@ -420,7 +411,7 @@ class VersionHandler(BaseHandler):
         self.write(response)
 
 
-class StatusHandler(BaseHandler):
+class StatusHandler(tornado.web.RequestHandler):
 
     async def get(self):
 
@@ -449,7 +440,7 @@ endpoints = [
     (r"/", RootHandler),
     (r"/api/v1/version", VersionHandler),
     (r"/api/v1/upload", UploadHandler),
-    (r"/api/v1/status", StatusHandler)
+    (r"/api/v1/status", StatusHandler),
 ]
 
 app = tornado.web.Application(endpoints, max_body_size=MAX_LENGTH)

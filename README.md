@@ -19,14 +19,64 @@ The service runs in Openshift Dedicated.
 
 The upload service workflow is as follows:
 
-    client > upload service > service topic on the MQ > validating service >
-    uploadvalidation topic on the MQ with result >
-    URL for permanent file location added to `available` topic on the MQ >
-    Other service consume the `available` topic
+  - The source client sends a payload of a specific MIME type to the upload service
+  - The upload service discovers the validating service via the MIME type, uploads
+  it to a temporary S3 bucket and puts a message on the message queue in the format
+  defined below
+  - The validating service checks that the payload is safe and properly formatted
+  - The validating service returns a message via the `platform.upload.validation` queue to the
+  upload service with a failure or success message
+  - If the validation succeeds, the upload service puts the payload on a permanent
+  S3 bucket, and puts a message on the `available` queue notifying services that
+  a new upload is available
+  - If the validation fails, the upload service puts the payload on a rejected
+  S3 bucket. This is available for diagnosis later in the event it is needed.
 
 The key here for most services is to understand that in order to be notified
 of new, validated payloads, they **must** subscribe to the `available` topic on the message
 queue.
+
+### Message Format
+
+The message from the upload service is JSON as seen below:
+
+    {'rh_account': '123456', 'principal': 'test_org', 'validation': 1, 'payload_id': '52df9f748eabcfea', 'size': 356, 'service': 'testareno', 'url': '/tmp/uploads/insights-upload-quarantine/52df9f748eabcfea'}
+   
+    
+Fields:
+
+  - rh_account: The account number used to upload. Can be used to separate data for tenancy purposes.
+  - principal:  The uploading org id
+  - validation: Validation status of the object
+  - payload_id: Unique ID provided to the payload created by 3Scale. This ID will be used for the life of the object.
+  - hash:       Legacy key name. Provides the same UID as payload_id. Will be deprecated.
+  - size:       Size of the payload in bytes
+  - service:    The name of the service to do the validation
+  - url:        URL for the location the payload can be downloaded from
+
+Principal is currently reflecting the org_id of the account, though that may change
+as we understand what is most useful regarding who uploaded a particular archive. The payload_id 
+is a unique ID assigned to the uploaded file by the 3Scale gateway. Everything else
+is fairly self-explanatory. The validation value is only used for metrics, so most end
+services will not utilize that.
+
+Services should return a message with the UID and the validation message to the `platform.upload.validation` topic:
+
+    {'payload_id': '52df9f748eabcfea', 'validation': 'success'} # or 'validation': 'failure'
+    
+Fields:
+
+  - payload_id: Unique ID being addresed by validation message
+  - validation: Either succes or failure based on whether the payload passed validation or not
+
+### Current Active Topics
+
+The following topics are currently in use in the MQ service:
+
+  - platform.upload.advisor             # for the advisor service
+  - platform.upload.testareno           # for testing the mq to upload service connection
+  - platform.upload.validation    # for responses from validation services
+  - platform.upload.available           # for new uploads available to other services
 
 ### Errors
 
@@ -74,18 +124,13 @@ Also, you need to add the following environment variable, in order to run the te
 
 #### Installing
 
-Once your environment variables are set on your localhost, bring up the stack:
+Once your environment variables are set on your localhost, bring up the stack. You
+may need to be root depending on your environment.
 
-    LINUX
-    cd ./docker && sh startup.sh
-
-    WINDOWS
-    cd .\docker
-    .\startup.ps1
+    cd ./docker && docker-compose up -d
     
-This will stand up the full stack as well as initialize the topics in the message 
-queue that are necessary for testing. The Kiel library does not automatically create 
-topics in the MQ when they do not exist, so created them is critical.
+This will stand up the full stack. You can follow logs in docker-compose with
+`docker-compose logs -f`.
 
 ### Bare metal
 
@@ -107,15 +152,6 @@ so they relaunch on reboot.
 Make sure that your Kafka server can accept connection from your apps. Especially the
 `listeners` configuration value in your `server.properties` config file must be properly
 set. If Kafka runs on the same machine as the apps, the default config should work.
-
-Create the needed topics (advisor, available, testareno, uploadvalidation) in Kafka either
-manually by running following command for every topic, or use the `create_topics.py`
-Python script with a `ZOOKEEPER` environment variable set. For a local instance with
-default settings, this would be `ZOOKEEPER=localhost:2181`.
-
-    kafka-topics --create --topic "$TOPIC" --partitions 1 --replication-factor 1 --if-not-exists --zookeeper "$ZOOKEEPER_HOSTNAME:$ZOOKEEPER_PORT"
-
-    ZOOKEEPER=localhost:2181 python3 create_topics.py
 
 ##### Python
 
@@ -146,7 +182,7 @@ Upload a file to see if the system is working properly. Any file will work in te
 as long as the `type` field is set properly. Use the `README.md` file in this repo if
 you'd like.
 
-    curl -vvvv -F "upload=@test-archive.tar.gz;type=application/vnd.redhat.testareno.something+tgz" localhost:8080/api/v1/upload
+    curl -vvvv -F "upload=@test-archive.tar.gz;type=application/vnd.redhat.testareno.something+tgz" -H "x-rh-insights-request-id: 52df9f748eabcfea" localhost:8080/api/v1/upload
 
 If you’re running the upload service app directly and not in Docker, use port 8888 instead
 of 8080 in the aforementioned command.

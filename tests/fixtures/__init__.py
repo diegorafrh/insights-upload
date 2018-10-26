@@ -184,14 +184,14 @@ def broker_stage_messages(s3_mocked, produce_queue_mocked):
             'rh_account': app.DUMMY_VALUES['rh_account'],
             'principal': app.DUMMY_VALUES['principal'],
             'validation': validation,
-            'hash': file_name,
+            'payload_id': file_name,
             'size': 100,
             'service': service,
             'url': file_path
         }
 
         if not avoid_produce_queue:
-            produce_queue_mocked.append({'topic': service, 'msg': values})
+            produce_queue_mocked.append({'topic': 'platform.upload.' + service, 'msg': values})
 
         return values
 

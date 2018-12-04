@@ -8,6 +8,10 @@ pylint = "*"
 pytest = "*"
 "flake8" = "*"
 "pep8" = "*"
+mock = "*"
+moto = "*"
+responses = "*"
+sh = "*"
 
 [packages]
 tornado = "*"
@@ -15,6 +19,7 @@ tornado = "*"
 requests = "*"
 botocore = "*"
 aiokafka = "*"
+logstash_formatter = "*"
 
 [requires]
 python_version = "3.6"

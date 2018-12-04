@@ -5,6 +5,9 @@ import json
 import logging
 import os
 import re
+import base64
+import sys
+
 from concurrent.futures import ThreadPoolExecutor
 from importlib import import_module
 from tempfile import NamedTemporaryFile
@@ -16,12 +19,20 @@ from kafka.errors import KafkaError
 from tornado.ioloop import IOLoop
 
 from utils import mnm
+from logstash_formatter import LogstashFormatterV1
 
 # Logging
-logging.basicConfig(
-    level=os.getenv("LOGLEVEL", "INFO"),
-    format="%(asctime)s %(threadName)s %(levelname)s -- %(message)s"
-)
+if any("KUBERNETES" in k for k in os.environ):
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(LogstashFormatterV1())
+    logging.root.setLevel(os.getenv("LOGLEVEL", "INFO"))
+    logging.root.addHandler(handler)
+else:
+    logging.basicConfig(
+        level=os.getenv("LOGLEVEL", "INFO"),
+        format="%(threadName)s %(levelname)s %(name)s - %(message)s"
+    )
+
 logger = logging.getLogger('upload-service')
 
 # Set Storage driver to use
@@ -29,11 +40,12 @@ storage_driver = os.getenv("STORAGE_DRIVER", "s3")
 storage = import_module("utils.storage.{}".format(storage_driver))
 
 # Upload content type must match this regex. Third field matches end service
-content_regex = r'^application/vnd\.redhat\.([a-z]+)\.([a-z]+)\+(tgz|zip)$'
+content_regex = r'^application/vnd\.redhat\.([a-z0-9-]+)\.([a-z0-9-]+)\+(tgz|zip)$'
 
 # set max length to 10.5 MB (one MB larger than peak)
 MAX_LENGTH = int(os.getenv('MAX_LENGTH', 11010048))
 LISTEN_PORT = int(os.getenv('LISTEN_PORT', 8888))
+RETRY_INTERVAL = int(os.getenv('RETRY_INTERVAL', 5))  # seconds
 
 # Maximum workers for threaded execution
 MAX_WORKERS = int(os.getenv('MAX_WORKERS', 50))
@@ -56,6 +68,44 @@ VALIDATION_QUEUE = os.getenv('VALIDATION_QUEUE', 'platform.upload.validation')
 # Message Queue
 MQ = os.getenv('KAFKAMQ', 'kafka:29092').split(',')
 MQ_GROUP_ID = os.getenv('MQ_GROUP_ID', 'upload')
+
+
+class MQClient(object):
+
+    def __init__(self, client, name):
+        self.client = client
+        self.name = name
+        self.connected = False
+
+    def __str__(self):
+        return f"MQClient {self.name} {self.client} {'connected' if self.connected else 'disconnected'}"
+
+    async def start(self):
+        while not self.connected:
+            try:
+                logger.info("Attempting to connect %s client.", self.name)
+                await self.client.start()
+                logger.info("%s client connected successfully.", self.name)
+                self.connected = True
+            except KafkaError:
+                logger.exception("Failed to connect %s client, retrying in %d seconds.", self.name, RETRY_INTERVAL)
+                await asyncio.sleep(RETRY_INTERVAL)
+
+    async def work(self, worker):
+        try:
+            await worker(self.client)
+        except KafkaError:
+            logger.exception("Encountered exception while working with %s client, reconnecting.", self.name)
+            self.connected = False
+
+    def run(self, worker):
+        async def _f():
+            while True:
+                await self.start()
+                await self.work(worker)
+        return _f
+
+
 mqc = AIOKafkaConsumer(
     VALIDATION_QUEUE, loop=IOLoop.current().asyncio_loop, bootstrap_servers=MQ,
     group_id=MQ_GROUP_ID
@@ -64,6 +114,8 @@ mqp = AIOKafkaProducer(
     loop=IOLoop.current().asyncio_loop, bootstrap_servers=MQ, request_timeout_ms=10000,
     connections_max_idle_ms=None
 )
+CONSUMER = MQClient(mqc, "consumer")
+PRODUCER = MQClient(mqp, "producer")
 
 # local queue for pushing items into kafka, this queue fills up if kafka goes down
 produce_queue = collections.deque([], 999)
@@ -88,84 +140,29 @@ def split_content(content):
     return service
 
 
-class MQStatus(object):
-    """Class used to track the status of the producer/consumer clients."""
-    mqc_connected = False
-    mqp_connected = False
+async def handle_validation(client):
+    data = await client.getmany()
+    for tp, msgs in data.items():
+        if tp.topic == VALIDATION_QUEUE:
+            await handle_file(msgs)
+    await asyncio.sleep(0.1)
 
 
-async def consumer():
-    """Consume indefinitely from the validation queue.
-    """
-    MQStatus.mqc_connected = False
-    while True:
-        # If not connected, attempt to connect...
-        if not MQStatus.mqc_connected:
-            try:
-                logger.info("Consume client not connected, attempting to connect...")
-                await mqc.start()
-                logger.info("Consumer client connected!")
-                MQStatus.mqc_connected = True
-            except KafkaError:
-                logger.exception('Consume client hit error, triggering re-connect...')
-                await asyncio.sleep(5)
-                continue
-
-        # Consume
-        try:
-            data = await mqc.getmany()
-            for tp, msgs in data.items():
-                if tp.topic == VALIDATION_QUEUE:
-                    await handle_file(msgs)
-        except KafkaError:
-            logger.exception('Consume client hit error, triggering re-connect...')
-            MQStatus.mqc_connected = False
+async def send_to_preprocessors(client):
+    if not produce_queue:
         await asyncio.sleep(0.1)
-
-
-async def producer():
-    """Produce items sitting in our local produce_queue to kafka
-
-    An item is a dict with keys 'topic' and 'msg', which contain:
-        topic {str} -- The service name to notify
-        msg {dict} -- JSON containing a rh_account, principal, payload_id,
-                        and url for download
-    """
-    MQStatus.mqp_connected = False
-    while True:
-        # If not connected to kafka, attempt to connect...
-        if not MQStatus.mqp_connected:
-            try:
-                logger.info("Producer client not connected, attempting to connect...")
-                await mqp.start()
-                logger.info("Producer client connected!")
-                MQStatus.mqp_connected = True
-            except KafkaError:
-                logger.exception('Producer client hit error, triggering re-connect...')
-                await asyncio.sleep(5)
-                continue
-
-        # Pull items off our queue to produce
-        if not produce_queue:
-            await asyncio.sleep(0.1)
-            continue
-
-        for _ in range(0, len(produce_queue)):
-            item = produce_queue.popleft()
-            topic = item['topic']
-            msg = item['msg']
-            logger.info(
-                "Popped item from produce queue (qsize: %d): topic %s: %s",
-                len(produce_queue), topic, msg
-            )
-            try:
-                await mqp.send_and_wait(topic, json.dumps(msg).encode('utf-8'))
-                logger.info("Produced on topic %s: %s", topic, msg)
-            except KafkaError:
-                logger.exception('Producer client hit error, triggering re-connect...')
-                MQStatus.mqp_connected = False
-                # Put the item back on the queue so we can push it when we reconnect
-                produce_queue.appendleft(item)
+    else:
+        item = produce_queue.popleft()
+        topic, msg = item["topic"], item["msg"]
+        logger.info(
+            "Popped item from produce queue (qsize: %d): topic %s: %s",
+            len(produce_queue), topic, msg
+        )
+        try:
+            await client.send_and_wait(topic, json.dumps(msg).encode("utf-8"))
+        except KafkaError:
+            produce_queue.appendleft(item)
+            raise
 
 
 async def handle_file(msgs):
@@ -200,7 +197,7 @@ async def handle_file(msgs):
             logger.info(url)
             produce_queue.append(
                 {
-                    'topic': 'available',
+                    'topic': 'platform.upload.available',
                     'msg': {'url': url,
                             'payload_id': payload_id}
                 }
@@ -269,10 +266,6 @@ class UploadHandler(tornado.web.RequestHandler):
 
         success = False
         upload_start = time()
-
-        if payload_id is None:
-            logger.error("No payload_id assigned. Upload Failed")
-            return
 
         try:
             url, callback = await IOLoop.current().run_in_executor(
@@ -376,11 +369,24 @@ class UploadHandler(tornado.web.RequestHandler):
         then offload for async processing
         """
         identity = None
+
         if not self.request.files.get('upload'):
             logger.info('Upload field not found')
             self.set_status(415, "Upload field not found")
             return
+
+        payload_id = self.request.headers.get('x-rh-insights-request-id')
+
+        if payload_id is None:
+            msg = "No payload_id assigned. Upload Failed"
+            logger.error(msg)
+            self.set_header("Content-Type", "text/plain")
+            self.set_status(400)
+            self.write(msg)
+            return
+
         invalid = self.upload_validation()
+
         if invalid:
             self.set_status(invalid[0], invalid[1])
             return
@@ -392,7 +398,6 @@ class UploadHandler(tornado.web.RequestHandler):
                 header = json.loads(base64.b64decode(self.request.headers['x-rh-identity']))
                 identity = header['identity']
             size = int(self.request.headers['Content-Length'])
-            payload_id = self.request.headers.get('x-rh-insights-request-id')
             body = self.request.files['upload'][0]['body']
 
             filename = await IOLoop.current().run_in_executor(None, self.write_data, body)
@@ -423,36 +428,10 @@ class VersionHandler(tornado.web.RequestHandler):
         self.write(response)
 
 
-class StatusHandler(tornado.web.RequestHandler):
-
-    async def get(self):
-
-        response = {"upload_service": "up",
-                    "message_queue_producer": "down",
-                    "message_queue_consumer": "down",
-                    "long_term_storage": "down",
-                    "quarantine_storage": "down",
-                    "rejected_storage": "down"}
-
-        if storage.up_check(storage.PERM):
-            response['long_term_storage'] = "up"
-        if storage.up_check(storage.QUARANTINE):
-            response['quarantine_storage'] = "up"
-        if storage.up_check(storage.REJECT):
-            response['rejected_storage'] = "up"
-        if MQStatus.mqp_connected:
-            response['message_queue_producer'] = "up"
-        if MQStatus.mqc_connected:
-            response['message_queue_consumer'] = "up"
-
-        self.write(response)
-
-
 endpoints = [
-    (r"/", RootHandler),
-    (r"/api/v1/version", VersionHandler),
-    (r"/api/v1/upload", UploadHandler),
-    (r"/api/v1/status", StatusHandler),
+    (r"/r/insights/platform/upload", RootHandler),
+    (r"/r/insights/platform/upload/api/v1/version", VersionHandler),
+    (r"/r/insights/platform/upload/api/v1/upload", UploadHandler),
 ]
 
 app = tornado.web.Application(endpoints, max_body_size=MAX_LENGTH)
@@ -461,10 +440,11 @@ app = tornado.web.Application(endpoints, max_body_size=MAX_LENGTH)
 def main():
     sleep(10)
     app.listen(LISTEN_PORT)
+    logger.info(f"Web server listening on port {LISTEN_PORT}")
     loop = IOLoop.current()
     loop.set_default_executor(thread_pool_executor)
-    loop.spawn_callback(consumer)
-    loop.spawn_callback(producer)
+    loop.spawn_callback(CONSUMER.run(handle_validation))
+    loop.spawn_callback(PRODUCER.run(send_to_preprocessors))
     try:
         loop.start()
     except KeyboardInterrupt:

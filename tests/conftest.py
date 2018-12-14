@@ -39,7 +39,8 @@ def local_file():
     except Exception:
         pass
 
-    sh.fallocate("-l", "100", file_path)
+    with open(file_path, "wb") as fp:
+        fp.write(b"0" * 100)
 
     yield file_path
 
@@ -141,14 +142,14 @@ def broker_stage_messages(s3_mocked, produce_queue_mocked):
     def set_url(_file, service, avoid_produce_queue=False, validation='success'):
         file_name = uuid.uuid4().hex
 
-        file_path, _ = s3_storage.write(
+        file_path = s3_storage.write(
             _file,
             s3_storage.QUARANTINE,
             file_name
         )
 
         values = {
-            'rh_account': app.DUMMY_VALUES['rh_account'],
+            'account': app.DUMMY_VALUES['account'],
             'principal': app.DUMMY_VALUES['principal'],
             'validation': validation,
             'payload_id': file_name,

@@ -40,34 +40,44 @@ queue.
 
 The message from the upload service is JSON as seen below:
 
-    {'rh_account': '123456', 'principal': 'test_org', 'validation': 1, 'payload_id': '52df9f748eabcfea', 'size': 356, 'service': 'testareno', 'url': '/tmp/uploads/insights-upload-quarantine/52df9f748eabcfea'}
-   
-    
+    {'account': '123456', 'rh_account': '123456', 'principal': 'test_org', 'payload_id': '52df9f748eabcfea', 'hash': '52df9f748eabcfea', 'size': 356, 'service': 'testareno', 'b64_identity': '<identity header base64 string>', 'metadata': {'some_key': 'some_value', 'some_other_key': 'some_other_value'}, 'url': '/tmp/uploads/insights-upload-quarantine/52df9f748eabcfea'}
+
 Fields:
 
-  - rh_account: The account number used to upload. Can be used to separate data for tenancy purposes.
+  - account: The account number used to upload. Can be used to separate data for tenancy purposes.
+  - rh_account: legacy support for the above value. To be deprecated
   - principal:  The uploading org id
-  - validation: Validation status of the object
   - payload_id: Unique ID provided to the payload created by 3Scale. This ID will be used for the life of the object.
   - hash:       Legacy key name. Provides the same UID as payload_id. Will be deprecated.
   - size:       Size of the payload in bytes
   - service:    The name of the service to do the validation
+  - b64_identity: The base64 string from `x-rh-identity` header
+  - metadata: Optional keys and values sent from the client
   - url:        URL for the location the payload can be downloaded from
 
 Principal is currently reflecting the org_id of the account, though that may change
-as we understand what is most useful regarding who uploaded a particular archive. The payload_id 
+as we understand what is most useful regarding who uploaded a particular archive. The payload_id
 is a unique ID assigned to the uploaded file by the 3Scale gateway. Everything else
-is fairly self-explanatory. The validation value is only used for metrics, so most end
-services will not utilize that.
+is fairly self-explanatory.
 
-Services should return a message with the UID and the validation message to the `platform.upload.validation` topic:
+Service should return most of the same data that was received with the addition of the `validation` key indicated success or failure of the object. They will return this data to the `platform.upload.validation` topic.
 
-    {'payload_id': '52df9f748eabcfea', 'validation': 'success'} # or 'validation': 'failure'
-    
+This is what a message with **minimum** required data should look like:
+
+    {'payload_id': '52df9f748eabcfea', 'service': 'advisor', 'validation': 'success'} # or 'validation': 'failure'
+
 Fields:
 
   - payload_id: Unique ID being addresed by validation message
+  - service: The service that performed the validation
   - validation: Either succes or failure based on whether the payload passed validation or not
+
+Optional Fields. These should be returned if at all possible for use in the available topic
+
+  - account: The account number from the processed payload
+  - principal: The principal from the processed payload
+  - b64_identity: The identity header.
+  - id: If inventory was posted to, return this id so other services can cross reference that data
 
 ### Current Active Topics
 
@@ -77,11 +87,14 @@ The following topics are currently in use in the MQ service:
   - platform.upload.testareno           # for testing the mq to upload service connection
   - platform.upload.validation    # for responses from validation services
   - platform.upload.available           # for new uploads available to other services
+  - platform.upload.hccm                # HCCM service
+  - platform.upload.compliance          # Compliance service
+  - platform.upload.qpc                 # QPC service
 
 ### Errors
 
 The upload service will report back to the client HTTP errors if something goes
-wrong. It will be the responsibility of the client to communicate that connection
+wrong with the initial upload. It will be the responsibility of the client to communicate that connection
 problem back to the user via a log message or some other means.
 
 ## Getting Started
@@ -100,11 +113,13 @@ upload-service app, and a consumer for a test queue.
 
     docker
     docker-compose
-    AWS credentials with S3 access
 
-By default, the app will use the insights S3 account. If you do not have access
-to this, you will need to provide your own AWS creds and buckets via environment
-variables:
+By default, the app will use [Minio.io](https://minio.io), as a S3 backend compatible
+with AWS' API.
+
+If you prefer to use a real S3 account, you will need to remove the environment variable
+S3_ENDPOINT_URL in ['docker/docker-compose.yml'](docker/docker-compose.yml) and provide
+your own AWS creds and buckets via environment variables:
 
     AWS_ACCESS_KEY_ID
     AWS_SECRET_ACCESS_KEY
@@ -113,7 +128,7 @@ variables:
     S3_QUARANTINE
     S3_PERM
     S3_REJECT
-    
+
 Another option is to use localdisk rather than S3 by setting an environment variable:
 
     STORAGE_DRIVER=localdisk
@@ -128,9 +143,12 @@ Once your environment variables are set on your localhost, bring up the stack. Y
 may need to be root depending on your environment.
 
     cd ./docker && docker-compose up -d
-    
+
 This will stand up the full stack. You can follow logs in docker-compose with
-`docker-compose logs -f`.
+`docker-compose logs -f`. By default, three buckets called 'insights-upload-perm-test',
+'insights-upload-quarantine', 'insights-upload-rejected' will be created.
+You may visit [http://localhost:9000](http://localhost:9000) to check the contents or
+create new buckets as you need.
 
 ### Bare metal
 
@@ -141,6 +159,7 @@ It’s possible to run the apps manually and make them connect to an existing Ka
     python3 (preferrably 3.6) with venv
     zookeeper
     kafka
+    minio or s3 credentials
 
 ##### Queue
 
@@ -152,6 +171,11 @@ so they relaunch on reboot.
 Make sure that your Kafka server can accept connection from your apps. Especially the
 `listeners` configuration value in your `server.properties` config file must be properly
 set. If Kafka runs on the same machine as the apps, the default config should work.
+
+If you are using Minio as a substitute of AWS S3, you may install it following its
+[documentation](https://docs.minio.io/docs/minio-quickstart-guide.html). In such case,
+make sure you set the environment variable S3_ENDPOINT_URL pointing to your local Minio
+installation, by default "127.0.0.1:9000""
 
 ##### Python
 
@@ -178,11 +202,22 @@ default settings this would be `KAFKAMQ=localhost:9092`.
 
 ## File upload
 
+The upload service expects an `x-rh-identity` header, as this is provided
+by 3scale when used in production. If you are running locally, you can
+apply this header yourself. Below is a **base64** encoded string that
+contains the following info:
+
+    '{"identity": {"account_number": "12345", "internal": {"org_id": "54321"}}}'
+
+Base64 String:
+
+    eyJpZGVudGl0eSI6IHsiYWNjb3VudF9udW1iZXIiOiAiMTIzNDUiLCAiaW50ZXJuYWwiOiB7Im9yZ19pZCI6ICI1NDMyMSJ9fX0=
+
 Upload a file to see if the system is working properly. Any file will work in testing
 as long as the `type` field is set properly. Use the `README.md` file in this repo if
 you'd like.
 
-    curl -vvvv -F "upload=@test-archive.tar.gz;type=application/vnd.redhat.testareno.something+tgz" -H "x-rh-insights-request-id: 52df9f748eabcfea" localhost:8080/r/insights/platform/upload/api/v1/upload
+    curl -vvvv -H "x-rh-identity: <your base64 string>" -F "upload=@test-archive.tar.gz;type=application/vnd.redhat.testareno.something+tgz" -H "x-rh-insights-request-id: 52df9f748eabcfea" localhost:8080/r/insights/platform/upload/api/v1/upload
 
 If you’re running the upload service app directly and not in Docker, use port 8888 instead
 of 8080 in the aforementioned command.
@@ -230,29 +265,38 @@ To test the app, activate the virtualenv and then run pytest and flake8.
     flake8
 
 There is several ways to generate the coverage report, but the commonly ways are:
-    
+
     1. pytest --cov=.
     2. pytest --cov=. --cov-report html
-    
+
 **NOTE**: you will find the HTML report at `./htmlcov`
 
 For last, but not less important, it is highly recommended to run all of your tests with `-rx` argument. There is a few tests that are using `pytest.xfail` which is a friendly way to flag that some test has failed, with this argument you'll be able to see the reason why those tests are failing.
 
 e.g:
-   
-    pytest -rx --cov=. 
+
+    pytest -rx --cov=.
 
 For information on Tornado testing, see [the documentation](http://www.tornadoweb.org/en/stable/_modules/tornado/testing.html)
 
 ## Deployment
 
 The upload service `master` branch has a webhook that notifies the Openshift Dedicated
-cluster to build a new image. This image is immediately deployed in the Platform-CI project.
-If this image is tested valid and operational, it should be tagged to QA for further testing,
-and then finally tagged to `Production`.
+cluster to build a new image. This image is immediately deployed in the **Platform-CI** project in the [insights-dev](https://console.insights-dev.openshift.com) cluster.
+If this image is tested valid and operational, it should be tagged to QA for further testing. Once tested, it must be copied to the **platform-stage** project in the [production](https://console.insights.openshift.com) cluster. Once there and tested, it can be tagged to **platform-prod**.
 
-**WIP** - the QA and Production projects are not in place yet. The project is deployed on
-`Platform-CI` only
+The commands for that process are as follows:
+
+    ===In insights-dev cluster===
+    oc tag platform-ci/upload-service:latest platform-qa/upload-service:latest
+
+    ===Copy to production cluster===
+    skopeo copy --src-creds=user:dev_login_token --dest-creds=user:prod_login_token \
+    docker://registry.insights-dev.openshift.com/platform-qa/upload-service:latest \
+    docker://registry.insights.openshift.com/platform-stage/upload-service:latest
+
+    ===In insights production cluster===
+    oc tag platform-stage/upload-service:latest platform-prod/upload-service:latest
 
 ## Contributing
 

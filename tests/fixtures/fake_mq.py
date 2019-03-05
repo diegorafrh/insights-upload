@@ -1,6 +1,5 @@
 from kafka.errors import KafkaError
 
-import app
 from typing import Text, Dict, ByteString
 from tornado import gen
 
@@ -38,16 +37,12 @@ class FakeMQ(object):
     is_down = False
 
     def __enter__(self):
-        self._orig_mqc, self._orig_mqp = app.mqc, app.mqp
-        app.mqc, app.mqp = self, self
         return self
 
     def __exit__(self, *args):
-        app.mqp, app.mqc = self._orig_mqp, self._orig_mqc
+        pass
 
     def __init__(self, *args, **kwargs):
-        self._orig_mqc = None
-        self._orig_mqp = None
         for k, v in kwargs.items():
             if not hasattr(self, k):
                 raise Exception("Bad parameter {} - FakeMQ".format(k))
@@ -88,7 +83,7 @@ class FakeMQ(object):
         return True
 
     @gen.coroutine
-    def getmany(self, avoid_iteration_control=False) -> Dict:
+    def getmany(self, avoid_iteration_control=False, timeout_ms=None, max_records=None) -> Dict:
         # At the moment, this is the only topic we consume from ...
         topic = "platform.upload.validation"
 

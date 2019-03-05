@@ -2,15 +2,16 @@ import asyncio
 import io
 import json
 import os
+import sh
 
 import pytest
 import requests
-from botocore.exceptions import ClientError
+import responses
 from tornado.httpclient import AsyncHTTPClient, HTTPClientError
 from tornado.testing import AsyncHTTPTestCase, gen_test
 from unittest import TestCase
 from re import search
-
+from kafkahelpers import ReconnectingClient
 
 import app
 from tests.fixtures.fake_mq import FakeMQ
@@ -19,8 +20,10 @@ from utils.storage import s3 as s3_storage
 from mock import patch
 
 client = AsyncHTTPClient()
-with open('VERSION', 'rb') as f:
-    VERSION = f.read()
+
+
+def cleanup():
+    sh.rm(app.TOPIC_CONFIG)
 
 
 class TestContentRegex(TestCase):
@@ -58,6 +61,10 @@ class TestContentRegex(TestCase):
             with self.subTest(mime_type=mime_type):
                 self.assertIsNone(search(app.content_regex, mime_type))
 
+    def test_supports_legacy(self):
+        self.assertEqual("advisor", app.get_service("application/x-gzip; charset=binary"))
+        self.assertEqual("fab", app.get_service("application/vnd.redhat.fab.service+tgz"))
+
 
 class TestUploadHandler(AsyncHTTPTestCase):
 
@@ -68,7 +75,7 @@ class TestUploadHandler(AsyncHTTPTestCase):
         # Build HTTP Request so that Tornado can recognize and use the payload test
         request = requests.Request(
             url="http://localhost:8888/r/insights/platform/upload/api/v1/upload", data={},
-            files={file_field_name: (file_name, io.BytesIO(os.urandom(file_size)), mime_type)} if file_name else None
+            files={file_field_name: (file_name, io.BytesIO(os.urandom(file_size)), mime_type)} if file_name else None,
         )
         request.headers["x-rh-insights-request-id"] = "test"
 
@@ -111,7 +118,7 @@ class TestUploadHandler(AsyncHTTPTestCase):
     def test_version(self):
         response = yield self.http_client.fetch(self.get_url('/r/insights/platform/upload/api/v1/version'), method='GET')
         self.assertEqual(response.code, 200)
-        self.assertEqual(response.body, b'{"version": "%s"}' % VERSION)
+        self.assertEqual(response.body, b'{"commit": "f06bfd06040103caae5fde96b9f4c8be7f4d979a", "date": "2019-01-29T21:25:11Z"}')
 
     @gen_test
     def test_upload_post_file_too_large(self):
@@ -163,6 +170,48 @@ class TestUploadHandler(AsyncHTTPTestCase):
         self.assertEqual(response.exception.code, 415)
         self.assertEqual(response.exception.message, 'Upload field not found')
 
+    @gen_test
+    def test_upload_post_unsupported_mime_type(self):
+        request_context = self.prepare_request_context(file_name='payload.tar.gz', mime_type='application/vnd.redhat.boop.something+tgz')
+
+        with self.assertRaises(HTTPClientError) as response:
+            yield self.http_client.fetch(
+                self.get_url('/r/insights/platform/upload/api/v1/upload'),
+                method='POST',
+                body=request_context.body,
+                headers=request_context.headers
+            )
+
+        self.assertEqual(response.exception.code, 415)
+        self.assertEqual(response.exception.message, 'Unsupported MIME type')
+
+
+class TestInventoryPost(object):
+
+    @responses.activate
+    @patch("app.INVENTORY_URL", "http://fakeinventory.com/r/insights/platform/inventory/api/v1/hosts")
+    def test_post_to_inventory_success(self):
+        values = {"account": "12345", "metadata": {"some_key": "some_value"}}
+        responses.add(responses.POST, app.INVENTORY_URL,
+                      json={"id": "4f81c749-e6e6-46a7-ba3f-e755001ba5ee"}, status=200)
+        method_response = app.post_to_inventory('1234', 'abcd1234', values)
+
+        assert method_response is 200
+        assert len(responses.calls) == 1
+        assert responses.calls[0].response.text == '{"id": "4f81c749-e6e6-46a7-ba3f-e755001ba5ee"}'
+
+    @responses.activate
+    @patch("app.INVENTORY_URL", "http://fakeinventory.com/r/insights/platform/inventory/api/v1/hosts")
+    def test_post_to_inventory_fail(self):
+        values = {"account": "12345", "metadata": {"bad_key": "bad_value"}}
+        responses.add(responses.POST, app.INVENTORY_URL,
+                      json={"error message": "boop"}, status=400)
+        method_response = app.post_to_inventory('1234', 'abcd1234', values)
+
+        assert method_response is 400
+        assert len(responses.calls) == 1
+        assert responses.calls[0].response.text == '{"error message": "boop"}'
+
 
 class TestProducerAndConsumer:
 
@@ -183,16 +232,17 @@ class TestProducerAndConsumer:
         [self._create_message_s3(local_file, broker_stage_messages) for _ in range(total_messages)]
 
         with FakeMQ() as mq:
-            producer = app.MQClient(mq, "producer").run(app.make_preprocessor())
-            assert app.mqp.produce_calls_count == 0
+            client = ReconnectingClient(mq, "producer")
+            producer = client.get_callback(app.make_preprocessor())
+            assert mq.produce_calls_count == 0
             assert len(app.produce_queue) == total_messages
 
             event_loop.run_until_complete(self.coroutine_test(producer))
 
-            assert app.mqp.produce_calls_count == total_messages
+            assert mq.produce_calls_count == total_messages
             assert len(app.produce_queue) == 0
-            assert app.mqp.disconnect_in_operation_called is False
-            assert app.mqp.trying_to_connect_failures_calls == 0
+            assert mq.disconnect_in_operation_called is False
+            assert mq.trying_to_connect_failures_calls == 0
 
     def test_consumer_with_s3_bucket(self, local_file, s3_mocked, broker_stage_messages, event_loop):
 
@@ -200,38 +250,36 @@ class TestProducerAndConsumer:
         topic = 'platform.upload.validation'
         produced_messages = []
         with FakeMQ() as mq:
-            consumer = app.MQClient(mq, "consumer").run(app.handle_validation)
+            client = ReconnectingClient(mq, "consumer")
+            consumer = client.get_callback(app.handle_validation)
 
             for _ in range(total_messages):
                 message = self._create_message_s3(
                     local_file, broker_stage_messages, avoid_produce_queue=True, topic=topic
                 )
-                app.mqc.send_and_wait(topic, json.dumps(message).encode('utf-8'), True)
+                mq.send_and_wait(topic, json.dumps(message).encode('utf-8'), True)
                 produced_messages.append(message)
 
             for m in produced_messages:
                 assert s3_storage.ls(s3_storage.QUARANTINE, m['payload_id'])['ResponseMetadata']['HTTPStatusCode'] == 200
 
-            assert app.mqc.produce_calls_count == total_messages
-            assert app.mqc.count_topic_messages(topic) == total_messages
+            assert mq.produce_calls_count == total_messages
+            assert mq.count_topic_messages(topic) == total_messages
             assert len(app.produce_queue) == 0
-            assert app.mqc.consume_calls_count == 0
+            assert mq.consume_calls_count == 0
 
             event_loop.run_until_complete(self.coroutine_test(consumer))
 
             for m in produced_messages:
-                with pytest.raises(ClientError) as e:
-                    s3_storage.ls(s3_storage.QUARANTINE, m['payload_id'])
-                assert str(e.value) == 'An error occurred (404) when calling the HeadObject operation: Not Found'
-
+                assert s3_storage.ls(s3_storage.QUARANTINE, m['payload_id'])['ResponseMetadata']['HTTPStatusCode'] == 404
                 assert s3_storage.ls(s3_storage.PERM, m['payload_id'])['ResponseMetadata']['HTTPStatusCode'] == 200
 
-            assert app.mqc.consume_calls_count > 0
-            assert app.mqc.consume_return_messages_count == 1
+            assert mq.consume_calls_count > 0
+            assert mq.consume_return_messages_count == 1
 
-            assert app.mqc.count_topic_messages(topic) == 0
-            assert app.mqc.disconnect_in_operation_called is False
-            assert app.mqc.trying_to_connect_failures_calls == 0
+            assert mq.count_topic_messages(topic) == 0
+            assert mq.disconnect_in_operation_called is False
+            assert mq.trying_to_connect_failures_calls == 0
             assert len(app.produce_queue) == 4
 
     def test_consumer_with_validation_failure(self, local_file, s3_mocked, broker_stage_messages, event_loop):
@@ -242,34 +290,32 @@ class TestProducerAndConsumer:
         produced_messages = []
 
         with FakeMQ() as mq:
-            consumer = app.MQClient(mq, "consumer").run(app.handle_validation)
+            client = ReconnectingClient(mq, "consumer")
+            consumer = client.get_callback(app.handle_validation)
             for _ in range(total_messages):
                 message = self._create_message_s3(
                     local_file, broker_stage_messages, avoid_produce_queue=True, topic=topic, validation='failure'
                 )
-                app.mqc.send_and_wait(topic, json.dumps(message).encode('utf-8'), True)
+                mq.send_and_wait(topic, json.dumps(message).encode('utf-8'), True)
                 produced_messages.append(message)
 
-            assert app.mqc.produce_calls_count == total_messages
-            assert app.mqc.count_topic_messages(topic) == total_messages
+            assert mq.produce_calls_count == total_messages
+            assert mq.count_topic_messages(topic) == total_messages
             assert len(app.produce_queue) == 0
-            assert app.mqc.consume_calls_count == 0
+            assert mq.consume_calls_count == 0
 
             event_loop.run_until_complete(self.coroutine_test(consumer))
 
             for m in produced_messages:
-                with pytest.raises(ClientError) as e:
-                    s3_storage.ls(s3_storage.QUARANTINE, m['payload_id'])
-                assert str(e.value) == 'An error occurred (404) when calling the HeadObject operation: Not Found'
-
+                assert s3_storage.ls(s3_storage.QUARANTINE, m['payload_id'])['ResponseMetadata']['HTTPStatusCode'] == 404
                 assert s3_storage.ls(s3_storage.REJECT, m['payload_id'])['ResponseMetadata']['HTTPStatusCode'] == 200
 
-            assert app.mqc.consume_calls_count > 0
-            assert app.mqc.consume_return_messages_count == 1
+            assert mq.consume_calls_count > 0
+            assert mq.consume_return_messages_count == 1
 
-            assert app.mqc.count_topic_messages(topic) == 0
-            assert app.mqc.disconnect_in_operation_called is False
-            assert app.mqc.trying_to_connect_failures_calls == 0
+            assert mq.count_topic_messages(topic) == 0
+            assert mq.disconnect_in_operation_called is False
+            assert mq.trying_to_connect_failures_calls == 0
             assert len(app.produce_queue) == 0
 
     def test_consumer_with_validation_unknown(self, local_file, s3_mocked, broker_stage_messages, event_loop):
@@ -280,27 +326,28 @@ class TestProducerAndConsumer:
         produced_messages = []
 
         with FakeMQ() as mq:
-            consumer = app.MQClient(mq, "consumer").run(app.handle_validation)
+            client = ReconnectingClient(mq, "consumer")
+            consumer = client.get_callback(app.handle_validation)
             for _ in range(total_messages):
                 message = self._create_message_s3(
                     local_file, broker_stage_messages, avoid_produce_queue=True, topic=topic, validation='unknown'
                 )
-                app.mqc.send_and_wait(topic, json.dumps(message).encode('utf-8'), True)
+                mq.send_and_wait(topic, json.dumps(message).encode('utf-8'), True)
                 produced_messages.append(message)
 
-            assert app.mqc.produce_calls_count == total_messages
-            assert app.mqc.count_topic_messages(topic) == total_messages
+            assert mq.produce_calls_count == total_messages
+            assert mq.count_topic_messages(topic) == total_messages
             assert len(app.produce_queue) == 0
-            assert app.mqc.consume_calls_count == 0
+            assert mq.consume_calls_count == 0
 
             event_loop.run_until_complete(self.coroutine_test(consumer))
 
-            assert app.mqc.consume_calls_count > 0
-            assert app.mqc.consume_return_messages_count == 1
+            assert mq.consume_calls_count > 0
+            assert mq.consume_return_messages_count == 1
 
-            assert app.mqc.count_topic_messages(topic) == 0
-            assert app.mqc.disconnect_in_operation_called is False
-            assert app.mqc.trying_to_connect_failures_calls == 0
+            assert mq.count_topic_messages(topic) == 0
+            assert mq.disconnect_in_operation_called is False
+            assert mq.trying_to_connect_failures_calls == 0
             assert len(app.produce_queue) == 0
 
     @patch("app.RETRY_INTERVAL", 0.01)
@@ -310,16 +357,17 @@ class TestProducerAndConsumer:
         [self._create_message_s3(local_file, broker_stage_messages) for _ in range(total_messages)]
 
         with FakeMQ(connection_failing_attempt_countdown=1, disconnect_in_operation=2) as mq:
-            producer = app.MQClient(mq, "producer").run(app.make_preprocessor())
-            assert app.mqp.produce_calls_count == 0
+            client = ReconnectingClient(mq, "producer")
+            producer = client.get_callback(app.make_preprocessor())
+            assert mq.produce_calls_count == 0
             assert len(app.produce_queue) == total_messages
 
             event_loop.run_until_complete(self.coroutine_test(producer))
 
-            assert app.mqp.produce_calls_count == total_messages
+            assert mq.produce_calls_count == total_messages
             assert len(app.produce_queue) == 0
-            assert app.mqp.disconnect_in_operation_called is True
-            assert app.mqp.trying_to_connect_failures_calls == 1
+            assert mq.disconnect_in_operation_called is True
+            assert mq.trying_to_connect_failures_calls == 1
 
     @patch("app.RETRY_INTERVAL", 0.01)
     def test_consumer_with_connection_issues(self, local_file, s3_mocked, broker_stage_messages, event_loop):
@@ -328,24 +376,28 @@ class TestProducerAndConsumer:
         topic = 'platform.upload.validation'
 
         with FakeMQ(connection_failing_attempt_countdown=1, disconnect_in_operation=2) as mq:
-            consumer = app.MQClient(mq, "consumer").run(app.handle_validation)
+            client = ReconnectingClient(mq, "consumer")
+            consumer = client.get_callback(app.handle_validation)
             for _ in range(total_messages):
                 message = self._create_message_s3(
                     local_file, broker_stage_messages, avoid_produce_queue=True, topic=topic
                 )
-                app.mqc.send_and_wait(topic, json.dumps(message).encode('utf-8'), True)
+                mq.send_and_wait(topic, json.dumps(message).encode('utf-8'), True)
 
-            assert app.mqc.produce_calls_count == total_messages
-            assert app.mqc.count_topic_messages(topic) == total_messages
+            assert mq.produce_calls_count == total_messages
+            assert mq.count_topic_messages(topic) == total_messages
             assert len(app.produce_queue) == 0
-            assert app.mqc.consume_calls_count == 0
+            assert mq.consume_calls_count == 0
 
             event_loop.run_until_complete(self.coroutine_test(consumer))
 
-            assert app.mqc.consume_calls_count > 0
-            assert app.mqc.consume_return_messages_count == 1
+            assert mq.consume_calls_count > 0
+            assert mq.consume_return_messages_count == 1
 
-            assert app.mqc.count_topic_messages(topic) == 0
-            assert app.mqc.disconnect_in_operation_called is True
-            assert app.mqc.trying_to_connect_failures_calls == 1
+            assert mq.count_topic_messages(topic) == 0
+            assert mq.disconnect_in_operation_called is True
+            assert mq.trying_to_connect_failures_calls == 1
             assert len(app.produce_queue) == 4
+
+
+cleanup()

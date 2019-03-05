@@ -5,6 +5,7 @@ from botocore.exceptions import ClientError
 
 AWS_ACCESS_KEY_ID = os.getenv('AWS_ACCESS_KEY_ID', None)
 AWS_SECRET_ACCESS_KEY = os.getenv('AWS_SECRET_ACCESS_KEY', None)
+S3_ENDPOINT_URL = os.getenv('S3_ENDPOINT_URL', None)
 
 # S3 buckets
 QUARANTINE = os.getenv('S3_QUARANTINE', 'insights-upload-quarantine')
@@ -12,6 +13,7 @@ PERM = os.getenv('S3_PERM', 'insights-upload-perm-test')
 REJECT = os.getenv('S3_REJECT', 'insights-upload-rejected')
 
 s3 = boto3.client('s3',
+                  endpoint_url=S3_ENDPOINT_URL,
                   aws_access_key_id=AWS_ACCESS_KEY_ID,
                   aws_secret_access_key=AWS_SECRET_ACCESS_KEY)
 
@@ -20,7 +22,7 @@ def write(data, dest, uuid):
     s3.upload_file(data, dest, uuid)
     url = s3.generate_presigned_url('get_object',
                                     Params={'Bucket': dest,
-                                            'Key': uuid}, ExpiresIn=100)
+                                            'Key': uuid}, ExpiresIn=3600)
     return url
 
 
@@ -36,7 +38,11 @@ def copy(src, dest, uuid):
 
 
 def ls(src, uuid):
-    return s3.head_object(Bucket=src, Key=uuid)
+    try:
+        result = s3.head_object(Bucket=src, Key=uuid)
+        return result
+    except ClientError:
+        return {'ResponseMetadata': {'HTTPStatusCode': 404}}
 
 
 def up_check(name):

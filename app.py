@@ -8,6 +8,7 @@ import re
 import base64
 import sys
 import requests
+import uuid
 
 from concurrent.futures import ThreadPoolExecutor
 from importlib import import_module
@@ -115,13 +116,17 @@ produce_queue = collections.deque([], 999)
 thread_pool_executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 
 
-def get_commit_date(url):
-        response = requests.get(url)
-        date = response.json()['committer']['date']
-        return date
+def get_commit_date(commit_id):
+    BASE_URL = "https://api.github.com/repos/RedHatInsights/insights-upload/git/commits/"
+    response = requests.get(BASE_URL + commit_id)
+    date = response.json()['committer']['date']
+    return date
 
 
-BUILD_DATE = get_commit_date("https://api.github.com/repos/RedHatInsights/insights-upload/git/commits/" + BUILD_ID)
+if DEVMODE:
+    BUILD_DATE = 'devmode'
+else:
+    BUILD_DATE = get_commit_date(BUILD_ID)
 
 def split_content(content):
     """Split the content_type to find the service name
@@ -253,11 +258,17 @@ def post_to_inventory(identity, payload_id, values):
     post = values['metadata']
     post['account'] = values['account']
     try:
-        response = requests.post(INVENTORY_URL, json=post, headers=headers)
-        if response.status_code != 200 and response.status_code != 201:
-            logger.error('Failed to post to inventory: ' + response.text, extra={"payload_id": payload_id})
+        response = requests.post(INVENTORY_URL, json=[post], headers=headers)
+        if response.status_code != 207:
+            error = response.json().get('detail')
+            logger.error('Failed to post to inventory: %s', error)
+        elif response.json()['data'][0]['status'] != 200 and response.json()['data'][0]['status'] != 201:
+            error = response.json()['data'][0].get('detail')
+            logger.error('Failed to post to inventory: ' + error, extra={"payload_id": payload_id})
         else:
-            logger.info('Payload posted to inventory: %s', payload_id, extra={"payload_id": payload_id})
+            inv_id = response.json()['data'][0]['host']['id']
+            logger.info('Payload [%s] posted to inventory. ID [%s]', payload_id, inv_id, extra={"payload_id": payload_id,
+                                                                                                "id": inv_id})
         return response.status_code
     except ConnectionError:
         logger.error("Unable to contact inventory", extra={"payload_id": payload_id})
@@ -442,7 +453,8 @@ class UploadHandler(tornado.web.RequestHandler):
         if not self.request.files.get('upload') and not self.request.files.get('file'):
             return self.error(415, "Upload field not found")
 
-        self.payload_id = self.request.headers.get('x-rh-insights-request-id')
+        request_id = self.request.headers.get('x-rh-insights-request-id')
+        self.payload_id = request_id if request_id else uuid.uuid4().hex
 
         # TODO: pull this out once no one is using the upload field anymore
         self.payload_data = self.request.files.get('upload')[0] if self.request.files.get('upload') else self.request.files.get('file')[0]

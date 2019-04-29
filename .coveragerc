@@ -1,5 +1,11 @@
 [run]
-omit = tests/*
+omit =
+    */tests/*
+    /docker/*
+    */tests/fixtures/__init__.py
+    */docker/consumer/app.py
+    */tests/conftest.py
+    */tests/fixtures/fake_mq.py
 
 [report]
 exclude_lines =

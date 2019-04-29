@@ -9,3 +9,6 @@ include
 lib
 lib64
 pip-selfcheck.json
+.scannerwork/
+coverage.xml
+pytest-report.xml

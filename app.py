@@ -7,8 +7,8 @@ import os
 import re
 import base64
 import sys
-import requests
 import uuid
+import watchtower
 
 from concurrent.futures import ThreadPoolExecutor
 from importlib import import_module
@@ -16,18 +16,33 @@ from tempfile import NamedTemporaryFile
 from time import time
 
 import tornado.web
-import tornado.httpclient
 from tornado.ioloop import IOLoop
 from kafkahelpers import ReconnectingClient
-from requests import ConnectionError
 
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 from kafka.errors import KafkaError
-from tornado.ioloop import IOLoop
-
-from utils import mnm
+from utils import mnm, config
 from logstash_formatter import LogstashFormatterV1
 from prometheus_async.aio import time as prom_time
+from boto3.session import Session
+
+
+def get_extra(account="unknown", request_id="unknown"):
+    return {
+        "account": account,
+        "request_id": request_id,
+    }
+
+
+container = str(uuid.uuid4())
+
+
+class ContextFilter(logging.Filter):
+
+    def filter(self, record):
+        record.container = container
+        return True
+
 
 # Logging
 LOGLEVEL = os.getenv("LOGLEVEL", "INFO")
@@ -43,112 +58,82 @@ else:
     )
 
 logger = logging.getLogger('upload-service')
+other_loggers = [logging.getLogger(n) for n in (
+    'tornado.general',
+    'tornado.application',
+    'kafkahelpers',
+)]
+for l in other_loggers:
+    l.setLevel('ERROR')
 
-DEVMODE = os.getenv('DEV', False)
+for l in (logger, *other_loggers):
+    l.addFilter(ContextFilter())
 
-if not DEVMODE:
-    # Valid topics config
-    VALID_TOPICS = []
-    TOPIC_CONFIG = os.getenv('TOPIC_CONFIG', '/etc/upload-service/topics.json')
-    with open(TOPIC_CONFIG, 'r') as f:
-        data = f.read().replace("'", '"')
-        topic_config = json.loads(data)
+NAMESPACE = config.get_namespace()
 
-    for topic in topic_config:
-        for name in topic['TOPIC_NAME'].split('.'):
-            VALID_TOPICS.append(name)
+if (config.CW_AWS_ACCESS_KEY_ID and config.CW_AWS_SECRET_ACCESS_KEY):
+    CW_SESSION = Session(aws_access_key_id=config.CW_AWS_ACCESS_KEY_ID,
+                         aws_secret_access_key=config.CW_AWS_SECRET_ACCESS_KEY,
+                         region_name=config.CW_AWS_REGION_NAME)
+    cw_handler = watchtower.CloudWatchLogHandler(boto3_session=CW_SESSION,
+                                                 log_group="platform",
+                                                 stream_name=NAMESPACE)
+    cw_handler.setFormatter(LogstashFormatterV1())
+    for l in (logger, *other_loggers):
+        l.addHandler(cw_handler)
+
+if not config.DEVMODE:
+    VALID_TOPICS = config.get_valid_topics()
 
 # Set Storage driver to use
-storage_driver = os.getenv("STORAGE_DRIVER", "s3")
-storage = import_module("utils.storage.{}".format(storage_driver))
+storage = import_module("utils.storage.{}".format(config.STORAGE_DRIVER))
 
 # Upload content type must match this regex. Third field matches end service
-content_regex = r'^application/vnd\.redhat\.([a-z0-9-]+)\.([a-z0-9-]+)\+(tgz|zip)$'
+content_regex = r'^application/vnd\.redhat\.(?P<service>[a-z0-9-]+)\.(?P<category>[a-z0-9-]+).*'
 
-# Items in this map are _special cases_ where the service cannot be extracted
-# from the Content-Type
-SERVICE_MAP = {
-    'application/x-gzip; charset=binary': 'advisor'
-}
-
-# set max length to 10.5 MB (one MB larger than peak)
-MAX_LENGTH = int(os.getenv('MAX_LENGTH', 11010048))
-LISTEN_PORT = int(os.getenv('LISTEN_PORT', 8888))
-RETRY_INTERVAL = int(os.getenv('RETRY_INTERVAL', 5))  # seconds
-
-# Maximum workers for threaded execution
-MAX_WORKERS = int(os.getenv('MAX_WORKERS', 50))
-
-# Maximum time to wait for an archive to upload to storage
-STORAGE_UPLOAD_TIMEOUT = int(os.getenv('STORAGE_UPLOAD_TIMEOUT', 60))
-
-# dummy values for testing without a real identity
-DUMMY_VALUES = {
-    'principal': 'default_principal',
-    'account': '000001',
-    'payload_id': '1234567890abcdef',
-    'url': 'http://defaulttesturl',
-    'validation': 0,
-    'size': 0
-}
-
-VALIDATION_QUEUE = os.getenv('VALIDATION_QUEUE', 'platform.upload.validation')
-
-INVENTORY_URL = os.getenv('INVENTORY_URL', 'http://inventory:8080/api/hosts')
-
-# Message Queue
-MQ = os.getenv('KAFKAMQ', 'kafka:29092').split(',')
-MQ_GROUP_ID = os.getenv('MQ_GROUP_ID', 'upload')
-
-BUILD_ID = os.getenv('OPENSHIFT_BUILD_COMMIT', 'somemadeupvalue')
-
-kafka_consumer = AIOKafkaConsumer(VALIDATION_QUEUE, loop=IOLoop.current().asyncio_loop,
-                                  bootstrap_servers=MQ, group_id=MQ_GROUP_ID)
-kafka_producer = AIOKafkaProducer(loop=IOLoop.current().asyncio_loop, bootstrap_servers=MQ,
+kafka_consumer = AIOKafkaConsumer(config.VALIDATION_QUEUE, loop=IOLoop.current().asyncio_loop,
+                                  bootstrap_servers=config.MQ, group_id=config.MQ_GROUP_ID)
+kafka_producer = AIOKafkaProducer(loop=IOLoop.current().asyncio_loop, bootstrap_servers=config.MQ,
                                   request_timeout_ms=10000, connections_max_idle_ms=None)
 CONSUMER = ReconnectingClient(kafka_consumer, "consumer")
 PRODUCER = ReconnectingClient(kafka_producer, "producer")
 
 # local queue for pushing items into kafka, this queue fills up if kafka goes down
-produce_queue = collections.deque([], 999)
+produce_queue = collections.deque()
+mnm.uploads_produce_queue_size.set_function(lambda: len(produce_queue))
 
 # Executor used to run non-async/blocking tasks
-thread_pool_executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+thread_pool_executor = ThreadPoolExecutor(max_workers=config.MAX_WORKERS)
+mnm.uploads_executor_qsize.set_function(lambda: thread_pool_executor._work_queue.qsize())
 
 
-def get_commit_date(commit_id):
-    BASE_URL = "https://api.github.com/repos/RedHatInsights/insights-upload/git/commits/"
-    response = requests.get(BASE_URL + commit_id)
-    date = response.json()['committer']['date']
-    return date
+async def defer(*args):
+    try:
+        name = args[0].__name__
+    except Exception:
+        name = "unknown"
+
+    with mnm.uploads_run_in_executor.labels(function=name).time():
+        return await IOLoop.current().run_in_executor(None, *args)
 
 
-if DEVMODE:
+if config.DEVMODE:
     BUILD_DATE = 'devmode'
 else:
-    BUILD_DATE = get_commit_date(BUILD_ID)
+    BUILD_DATE = config.get_commit_date(config.BUILD_ID)
 
-def split_content(content):
-    """Split the content_type to find the service name
 
-    Arguments:
-        content {str} -- content-type of the payload
-
-    Returns:
-        str -- Service name to be notified of upload
+def clean_up_metadata(facts):
     """
-    service = content.split('.')[2]
-    return service
-
-
-def strip_empty_facts(facts):
-    """
-    Empy values need to be stripped from metadata prior to posting to inventory.
+    Empty values need to be stripped from metadata prior to posting to inventory.
+    Display_name must be greater than 1 and less than 200 characters.
     """
     defined_facts = {}
     for fact in facts:
         if facts[fact]:
             defined_facts.update({fact: facts[fact]})
+    if 'display_name' in defined_facts and len(defined_facts['display_name']) not in range(2, 200):
+        defined_facts.pop('display_name')
     return defined_facts
 
 
@@ -156,50 +141,73 @@ def get_service(content_type):
     """
     Returns the service that content_type maps to.
     """
-    if content_type in SERVICE_MAP:
-        return SERVICE_MAP[content_type]
+    if content_type in config.SERVICE_MAP:
+        return config.SERVICE_MAP[content_type]
     else:
         m = re.search(content_regex, content_type)
         if m:
-            return split_content(content_type)
+            return m.groupdict()
     raise Exception("Could not resolve a service from the given content_type")
 
 
 async def handle_validation(client):
     data = await client.getmany(timeout_ms=1000, max_records=30)
     for tp, msgs in data.items():
-        if tp.topic == VALIDATION_QUEUE:
-            await handle_file(msgs)
+        if tp.topic == config.VALIDATION_QUEUE:
+            logger.info("Processing %s messages from topic [%s]", len(msgs), tp.topic, extra={
+                "topic": tp.topic
+            })
+            # TODO: Figure out how to properly handle failures
+            await asyncio.gather(*[handle_file(msg) for msg in msgs])
 
 
 def make_preprocessor(queue=None):
     queue = produce_queue if queue is None else queue
 
     async def send_to_preprocessors(client):
+        extra = get_extra()
         if not queue:
             await asyncio.sleep(0.1)
         else:
-            item = queue.popleft()
-            topic, msg, payload_id = item['topic'], item['msg'], item['msg'].get('payload_id')
+            try:
+                item = queue.popleft()
+            except Exception:
+                logger.exception("Failed to popleft", extra=extra)
+                return
+
+            try:
+                topic, msg, payload_id = item['topic'], item['msg'], item['msg'].get('payload_id')
+                extra["account"] = msg["account"]
+                extra["request_id"] = payload_id
+                mnm.uploads_popped_to_topic.labels(topic=topic).inc()
+            except Exception:
+                logger.exception("Bad data from produce_queue.", extra={"item": item, **extra})
+                return
+
             logger.info(
                 "Popped data from produce queue (qsize now: %d) for topic [%s], payload_id [%s]: %s",
-                len(queue), topic, payload_id, msg
-            )
+                len(queue), topic, payload_id, msg, extra=extra)
             try:
-                await client.send_and_wait(topic, json.dumps(msg).encode("utf-8"))
-                logger.info("send data for topic [%s] with payload_id [%s] succeeded", topic, payload_id, extra={"payload_id": payload_id})
+                with mnm.uploads_json_dumps.labels(key="send_to_preprocessors").time():
+                    data = json.dumps(msg)
+                with mnm.uploads_send_and_wait_seconds.time():
+                    await client.send_and_wait(topic, data.encode("utf-8"))
+                logger.info("send data for topic [%s] with payload_id [%s] succeeded", topic, payload_id, extra=extra)
             except KafkaError:
                 queue.append(item)
                 logger.error(
                     "send data for topic [%s] with payload_id [%s] failed, put back on queue (qsize now: %d)",
-                    topic, payload_id, len(queue), extra={"payload_id": payload_id}
-                )
+                    topic, payload_id, len(queue), extra=extra)
                 raise
+            except Exception:
+                logger.exception("Failure to send_and_wait. Did *not* put item back on queue.",
+                                 extra={"queue_msg": msg, **extra})
+
     return send_to_preprocessors
 
 
 @prom_time(mnm.uploads_handle_file_seconds)
-async def handle_file(msgs):
+async def handle_file(msg):
     """Determine which bucket to put a payload in based on the message
        returned from the validating service.
 
@@ -208,83 +216,67 @@ async def handle_file(msgs):
     Arguments:
         msgs -- list of kafka messages consumed on validation topic
     """
-    for msg in msgs:
-        try:
-            data = json.loads(msg.value)
-        except ValueError:
-            logger.error("handle_file(): unable to decode msg as json: {}".format(msg.value))
-            continue
+    extra = get_extra()
 
-        if 'payload_id' not in data and 'hash' not in data:
-            logger.error("payload_id or hash not in message. Payload not removed from quarantine.")
-            continue
-
-        # get the payload_id. Getting the hash is temporary until consumers update
-        payload_id = data['payload_id'] if 'payload_id' in data else data.get('hash')
-        result = data.get('validation')
-
-        logger.info('processing message: payload [%s] - %s', payload_id, result, extra={"payload_id": payload_id})
-
-        if storage.ls(storage.QUARANTINE, payload_id)['ResponseMetadata']['HTTPStatusCode'] == 200:
-            if result.lower() == 'success':
-                mnm.uploads_validated.inc()
-
-                url = await IOLoop.current().run_in_executor(
-                    None, storage.copy, storage.QUARANTINE, storage.PERM, payload_id
-                )
-                data = {
-                    'topic': 'platform.upload.available',
-                    'msg': {
-                        'id': data.get('id'),
-                        'url': url,
-                        'service': data.get('service'),
-                        'payload_id': payload_id,
-                        'account': data.get('account'),
-                        'principal': data.get('principal'),
-                        'b64_identity': data.get('b64_identity'),
-                        'rh_account': data.get('account'),  # deprecated key, temp for backward compatibility
-                        'rh_principal': data.get('principal'),  # deprecated key, temp for backward compatibility
-                    }
-                }
-                produce_queue.append(data)
-                logger.info(
-                    "data for topic [%s], payload_id [%s] put on produce queue (qsize now: %d)",
-                    data['topic'], payload_id, len(produce_queue), extra={"payload_id": payload_id}
-                )
-                logger.debug("payload_id [%s] data: %s", payload_id, data)
-            elif result.lower() == 'failure':
-                mnm.uploads_invalidated.inc()
-                logger.info('payload_id [%s] rejected', payload_id)
-                url = await IOLoop.current().run_in_executor(
-                    None, storage.copy, storage.QUARANTINE, storage.REJECT, payload_id
-                )
-            else:
-                logger.info('Unrecognized result: %s', result.lower())
-        else:
-            logger.info('payload_id [%s] no longer in quarantine', payload_id, extra={"payload_id": payload_id})
-
-
-def post_to_inventory(identity, payload_id, values):
-    headers = {'x-rh-identity': identity, 'Content-Type': 'application/json'}
-    post = strip_empty_facts(values['metadata'])
-    post['account'] = values['account']
     try:
-        response = requests.post(INVENTORY_URL, json=[post], headers=headers)
-        if response.status_code != 207:
-            error = response.json().get('detail')
-            logger.error('Failed to post to inventory: %s', error)
-            return None
-        elif response.json()['data'][0]['status'] != 200 and response.json()['data'][0]['status'] != 201:
-            error = response.json()['data'][0].get('detail')
-            logger.error('Failed to post to inventory: ' + error, extra={"payload_id": payload_id})
-            return None
+        with mnm.uploads_json_loads.labels(key="handle_file").time():
+            data = json.loads(msg.value)
+        logger.debug("handling_data: %s", data, extra=extra)
+    except Exception:
+        logger.error("handle_file(): unable to decode msg as json: {}".format(msg.value), extra=extra)
+        return
+
+    if 'payload_id' not in data and 'hash' not in data:
+        logger.error("payload_id or hash not in message. Payload not removed from permanent.", extra=extra)
+        return
+
+    # get the payload_id. Getting the hash is temporary until consumers update
+    payload_id = data['payload_id'] if 'payload_id' in data else data.get('hash')
+    extra["request_id"] = payload_id
+    extra["account"] = account = data.get('account', 'unknown')
+    result = data.get('validation', 'unknown')
+
+    logger.info('processing message: payload [%s] - %s', payload_id, result, extra=extra)
+
+    r = await defer(storage.ls, storage.PERM, payload_id)
+
+    if r['ResponseMetadata']['HTTPStatusCode'] == 200:
+        if result.lower() == 'success':
+            mnm.uploads_validated.inc()
+
+            url = await defer(storage.get_url, storage.PERM, payload_id)
+            data = {
+                'topic': 'platform.upload.available',
+                'msg': {
+                    'id': data.get('id'),
+                    'url': url,
+                    'service': data.get('service'),
+                    'payload_id': payload_id,
+                    'account': account,
+                    'principal': data.get('principal'),
+                    'b64_identity': data.get('b64_identity'),
+                    'satellite_managed': data.get('satellite_managed'),
+                    'rh_account': account,  # deprecated key, temp for backward compatibility
+                    'rh_principal': data.get('principal'),  # deprecated key, temp for backward compatibility
+                }
+            }
+            mnm.uploads_produced_to_topic.labels(topic="platform.upload.available").inc()
+            produce_queue.append(data)
+            logger.info(
+                "data for topic [%s], payload_id [%s], inv_id [%s] put on produce queue (qsize now: %d)",
+                data['topic'], payload_id, data["msg"].get("id"), len(produce_queue), extra=extra)
+            logger.debug("payload_id [%s] data: %s", payload_id, data, extra=extra)
+        elif result.lower() == 'failure':
+            mnm.uploads_invalidated.inc()
+            logger.info('payload_id [%s] rejected', payload_id, extra=extra)
+            url = await defer(storage.copy, storage.PERM, storage.REJECT, payload_id, account)
+        elif result.lower() == 'handoff':
+            mnm.uploads_handed_off.inc()
+            logger.info('payload_id [%s] handed off', payload_id, extra=extra)
         else:
-            inv_id = response.json()['data'][0]['host']['id']
-            logger.info('Payload [%s] posted to inventory. ID [%s]', payload_id, inv_id, extra={"payload_id": payload_id,
-                                                                                                "id": inv_id})
-            return inv_id
-    except ConnectionError:
-        logger.error("Unable to contact inventory", extra={"payload_id": payload_id})
+            logger.info('Unrecognized result: %s', result.lower(), extra=extra)
+    else:
+        logger.info('payload_id [%s] no longer in permanent bucket', payload_id, extra=extra)
 
 
 class NoAccessLog(tornado.web.RequestHandler):
@@ -301,16 +293,36 @@ class NoAccessLog(tornado.web.RequestHandler):
 
 
 class RootHandler(NoAccessLog):
-    """Handles requests to root
+    """Handles requests to document root
     """
 
     def get(self):
         """Handle GET requests to the root url
+        ---
+        description: Used for OpenShift Liveliness probes
+        responses:
+            200:
+                description: OK
+                content:
+                    text/plain:
+                        schema:
+                            type: string
+                            example: boop
         """
         self.write("boop")
 
     def options(self):
         """Return a header containing the available methods
+        ---
+        description: Add a header containing allowed methods
+        responses:
+            200:
+                description: OK
+                headers:
+                    Allow:
+                        description: Allowed methods
+                        schema:
+                            type: string
         """
         self.add_header('Allow', 'GET, HEAD, OPTIONS')
 
@@ -324,26 +336,38 @@ class UploadHandler(tornado.web.RequestHandler):
         Returns:
             tuple -- status code and a user friendly message
         """
+        extra = get_extra(account=self.account, request_id=self.payload_id)
         content_length = int(self.request.headers["Content-Length"])
-        if content_length >= MAX_LENGTH:
+        if content_length >= config.MAX_LENGTH:
             mnm.uploads_too_large.inc()
-            return self.error(413, f"Payload too large: {content_length}. Should not exceed {MAX_LENGTH} bytes")
+            logger.error("Payload too large. Request ID [%s] - Length %s", self.payload_id, str(config.MAX_LENGTH), extra=extra)
+            return self.error(413, f"Payload too large: {content_length}. Should not exceed {config.MAX_LENGTH} bytes", **extra)
         try:
-            get_service(self.payload_data['content_type'])
+            serv_dict = get_service(self.payload_data['content_type'])
         except Exception:
             mnm.uploads_unsupported_filetype.inc()
-            logger.error("Unsupported Media Type: [%s] - Request-ID [%s]", self.payload_data['content_type'], self.payload_id, extra={"payload_id": self.payload_id})
-            return self.error(415, 'Unsupported Media Type')
-        if not DEVMODE and get_service(self.payload_data['content_type']) not in VALID_TOPICS:
-            logger.error("Unsupported MIME type: [%s] - Request-ID [%s]", self.payload_data['content_type'], self.payload_id, extra={"payload_id": self.payload_id})
-            return self.error(415, 'Unsupported MIME type')
+            logger.exception("Unsupported Media Type: [%s] - Request-ID [%s]", self.payload_data['content_type'], self.payload_id, extra=extra)
+            return self.error(415, 'Unsupported Media Type', **extra)
+        if not config.DEVMODE and serv_dict["service"] not in VALID_TOPICS:
+            logger.error("Unsupported MIME type: [%s] - Request-ID [%s]", self.payload_data['content_type'], self.payload_id, extra=extra)
+            return self.error(415, 'Unsupported MIME type', **extra)
 
     def get(self):
         """Handles GET requests to the upload endpoint
+        ---
+        description: Get accepted content types
+        responses:
+            200:
+                description: OK
+                content:
+                    text/plain:
+                        schema:
+                            type: string
+                            example: 'Accepted Content-Types: gzipped tarfile, zip file'
         """
         self.write("Accepted Content-Types: gzipped tarfile, zip file")
 
-    async def upload(self, filename, tracking_id, payload_id):
+    async def upload(self, filename, tracking_id, payload_id, identity):
         """Write the payload to the configured storage
 
         Storage write and os file operations are not async so we offload to executor.
@@ -358,30 +382,27 @@ class UploadHandler(tornado.web.RequestHandler):
             str -- URL of uploaded file if successful
             None if upload failed
         """
+        user_agent = self.request.headers.get("User-Agent")
+        extra = get_extra(account=self.account, request_id=payload_id)
 
         upload_start = time()
-        logger.info("tracking id [%s] payload_id [%s] attempting upload", tracking_id, payload_id, extra={"payload_id": payload_id})
-
+        logger.info("tracking id [%s] payload_id [%s] attempting upload", tracking_id, payload_id, extra=extra)
         try:
-            url = await IOLoop.current().run_in_executor(
-                None, storage.write, filename, storage.QUARANTINE, payload_id
-            )
+            url = await defer(storage.write, filename, storage.PERM, payload_id, self.account, user_agent)
             elapsed = time() - upload_start
 
             logger.info(
                 "tracking id [%s] payload_id [%s] uploaded! elapsed [%fsec] url [%s]",
-                tracking_id, payload_id, elapsed, url
-            )
+                tracking_id, payload_id, elapsed, url, extra=extra)
 
             return url
         except Exception:
             elapsed = time() - upload_start
             logger.exception(
                 "Exception hit uploading: tracking id [%s] payload_id [%s] elapsed [%fsec]",
-                tracking_id, payload_id, elapsed, extra={"payload_id": payload_id}
-            )
+                tracking_id, payload_id, elapsed, extra=extra)
         finally:
-            await IOLoop.current().run_in_executor(None, os.remove, filename)
+            await defer(os.remove, filename)
 
     async def process_upload(self):
         """Process the uploaded file we have received.
@@ -397,34 +418,36 @@ class UploadHandler(tornado.web.RequestHandler):
 
         Write to storage, send message to MQ
         """
+        extra = get_extra(account=self.account, request_id=self.payload_id)
         values = {}
         # use dummy values for now if no account given
         if self.identity:
-            values['account'] = self.identity['account_number']
-            values['rh_account'] = self.identity['account_number']
+            values['account'] = self.account
+            values['rh_account'] = self.account
             values['principal'] = self.identity['internal'].get('org_id') if self.identity.get('internal') else None
         else:
-            values['account'] = DUMMY_VALUES['account']
-            values['principal'] = DUMMY_VALUES['principal']
+            values['account'] = config.DUMMY_VALUES['account']
+            values['principal'] = config.DUMMY_VALUES['principal']
         values['payload_id'] = self.payload_id
         values['hash'] = self.payload_id  # provided for backward compatibility
         values['size'] = self.size
         values['service'] = self.service
+        values['category'] = self.category
         values['b64_identity'] = self.b64_identity
         if self.metadata:
-            values['metadata'] = json.loads(self.metadata)
-            values['id'] = post_to_inventory(self.b64_identity, self.payload_id, values)
-            del values['metadata']
+            with mnm.uploads_json_loads.labels(key="process_upload").time():
+                values['metadata'] = clean_up_metadata(json.loads(self.metadata))
 
-        url = await self.upload(self.filename, self.tracking_id, self.payload_id)
+        url = await self.upload(self.filename, self.tracking_id, self.payload_id, self.identity)
 
         if url:
             values['url'] = url
             topic = 'platform.upload.' + self.service
+            mnm.uploads_produced_to_topic.labels(topic=topic).inc()
             produce_queue.append({'topic': topic, 'msg': values})
             logger.info(
                 "Data for payload_id [%s] to topic [%s] put on produce queue (qsize now: %d)",
-                self.payload_id, topic, len(produce_queue), extra={"payload_id": self.payload_id}
+                self.payload_id, topic, len(produce_queue), extra=extra
             )
 
     @mnm.uploads_write_tarfile.time()
@@ -446,8 +469,8 @@ class UploadHandler(tornado.web.RequestHandler):
             filename = tmp.name
         return filename
 
-    def error(self, code, message):
-        logger.error(message)
+    def error(self, code, message, **kwargs):
+        logger.error(message, extra=kwargs)
         self.set_status(code, message)
         self.set_header("Content-Type", "text/plain")
         self.write(message)
@@ -459,37 +482,57 @@ class UploadHandler(tornado.web.RequestHandler):
 
         Validate upload, get service name, create UUID, save to local storage,
         then offload for async processing
+        ---
+        description: Process Insights archive
+        responses:
+            202:
+                description: Upload payload accepted
+            413:
+                description: Payload too large
+            415:
+                description: Upload field not found
         """
         mnm.uploads_total.inc()
-        self.identity = None
+        self.payload_id = self.request.headers.get('x-rh-insights-request-id', uuid.uuid4().hex)
+        self.account = "unknown"
+
+        # is this really ok to be optional?
+        self.b64_identity = self.request.headers.get('x-rh-identity')
+        if self.b64_identity:
+            with mnm.uploads_json_loads.labels(key="post").time():
+                header = json.loads(base64.b64decode(self.b64_identity))
+            self.identity = header['identity']
+            self.account = self.identity["account_number"]
+
+        extra = get_extra(account=self.account, request_id=self.payload_id)
 
         if not self.request.files.get('upload') and not self.request.files.get('file'):
-            return self.error(415, "Upload field not found")
-
-        request_id = self.request.headers.get('x-rh-insights-request-id')
-        self.payload_id = request_id if request_id else uuid.uuid4().hex
+            return self.error(
+                415,
+                "Upload field not found",
+                files=list(self.request.files),
+                **extra
+            )
 
         # TODO: pull this out once no one is using the upload field anymore
         self.payload_data = self.request.files.get('upload')[0] if self.request.files.get('upload') else self.request.files.get('file')[0]
 
         if self.payload_id is None:
-            return self.error(400, "No payload_id assigned.  Upload failed.")
+            return self.error(400, "No payload_id assigned.  Upload failed.", **extra)
 
         if self.upload_validation():
             mnm.uploads_invalid.inc()
         else:
             mnm.uploads_valid.inc()
             self.tracking_id = str(self.request.headers.get('Tracking-ID', "null"))
-            self.metadata = self.request.body_arguments['metadata'][0].decode('utf-8') if self.request.body_arguments.get('metadata') else None
-            self.service = get_service(self.payload_data['content_type'])
-            if self.request.headers.get('x-rh-identity'):
-                header = json.loads(base64.b64decode(self.request.headers['x-rh-identity']))
-                self.identity = header['identity']
-                self.b64_identity = self.request.headers['x-rh-identity']
+            self.metadata = self.__get_metadata_from_request()
+            service_dict = get_service(self.payload_data['content_type'])
+            self.service = service_dict["service"]
+            self.category = service_dict["category"]
             self.size = int(self.request.headers['Content-Length'])
             body = self.payload_data['body']
 
-            self.filename = await IOLoop.current().run_in_executor(None, self.write_data, body)
+            self.filename = await defer(self.write_data, body)
 
             self.set_status(202, "Accepted")
 
@@ -500,8 +543,24 @@ class UploadHandler(tornado.web.RequestHandler):
 
     def options(self):
         """Handle OPTIONS request to upload endpoint
+        ---
+        description: Add a header containing allowed methods
+        responses:
+            200:
+                description: OK
+                headers:
+                    Allow:
+                        description: Allowed methods
+                        schema:
+                            type: string
         """
         self.add_header('Allow', 'GET, POST, HEAD, OPTIONS')
+
+    def __get_metadata_from_request(self):
+        if self.request.files.get('metadata'):
+            return self.request.files['metadata'][0]['body'].decode('utf-8')
+        elif self.request.body_arguments.get('metadata'):
+            return self.request.body_arguments['metadata'][0].decode('utf-8')
 
 
 class VersionHandler(tornado.web.RequestHandler):
@@ -510,8 +569,24 @@ class VersionHandler(tornado.web.RequestHandler):
 
     def get(self):
         """Handle GET request to the `version` endpoint
+        ---
+        description: Get version identifying information
+        responses:
+            200:
+                description: OK
+                content:
+                    application/json:
+                        schema:
+                            type: object
+                            properties:
+                                commit:
+                                    type: string
+                                    example: ab3a3a90b48bb1101a287b754d33ac3b2316fdf2
+                                date:
+                                    type: string
+                                    example: '2019-03-19T14:17:27Z'
         """
-        response = {'commit': BUILD_ID,
+        response = {'commit': config.BUILD_ID,
                     'date': BUILD_DATE}
         self.write(response)
 
@@ -521,22 +596,57 @@ class MetricsHandler(NoAccessLog):
     """
 
     def get(self):
+        """Get metrics for upload service
+        ---
+        description: Get metrics for upload service
+        responses:
+            200:
+                description: OK
+                content:
+                    text/plain:
+                        schema:
+                            type: string
+        """
         self.write(mnm.generate_latest())
 
 
+class SpecHandler(tornado.web.RequestHandler):
+    """Handle requests for service's API Spec
+    """
+
+    def get(self):
+        """Get the openapi/swagger spec for the upload service
+        ---
+        description: Get openapi spec for upload service
+        responses:
+            200:
+                description: OK
+        """
+        response = config.spec.to_dict()
+        self.write(response)
+
+
 endpoints = [
+    (config.API_PREFIX, RootHandler),
+    (config.API_PREFIX + "/v1/version", VersionHandler),
+    (config.API_PREFIX + "/v1/upload", UploadHandler),
+    (config.API_PREFIX + "/v1/openapi.json", SpecHandler),
     (r"/r/insights/platform/upload", RootHandler),
     (r"/r/insights/platform/upload/api/v1/version", VersionHandler),
     (r"/r/insights/platform/upload/api/v1/upload", UploadHandler),
+    (r"/r/insights/platform/upload/api/v1/openapi.json", SpecHandler),
     (r"/metrics", MetricsHandler)
 ]
 
-app = tornado.web.Application(endpoints, max_body_size=MAX_LENGTH)
+for urlSpec in endpoints:
+    config.spec.path(urlspec=urlSpec)
+
+app = tornado.web.Application(endpoints, max_body_size=config.MAX_LENGTH)
 
 
 def main():
-    app.listen(LISTEN_PORT)
-    logger.info(f"Web server listening on port {LISTEN_PORT}")
+    app.listen(config.LISTEN_PORT)
+    logger.info(f"Web server listening on port {config.LISTEN_PORT}")
     loop = IOLoop.current()
     loop.set_default_executor(thread_pool_executor)
     loop.spawn_callback(CONSUMER.get_callback(handle_validation))

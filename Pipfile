@@ -23,6 +23,12 @@ logstash_formatter = "*"
 prometheus-client = ">=0.5.0"
 kafkahelpers = "*"
 prometheus-async = "*"
+requests = "*"
+attrs = "*"
+apidoc = "*"
+watchtower = "*"
+apispec = "*"
+apispec-webframeworks = "*"
 
 [requires]
 python_version = "3.6"

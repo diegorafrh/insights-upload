@@ -12,7 +12,7 @@ import sh
 from moto import mock_s3
 
 
-from utils import mnm
+from utils import mnm, config
 from utils.storage import localdisk as local_storage, s3 as s3_storage
 from tests.fixtures import StopLoopException
 
@@ -54,8 +54,8 @@ app = prepare_app()
 def s3_mocked():
     with mock_s3():
         client = boto3.client("s3")
-        client.create_bucket(Bucket=s3_storage.QUARANTINE)
         client.create_bucket(Bucket=s3_storage.PERM)
+        client.create_bucket(Bucket=s3_storage.REJECT)
         s3_storage.s3 = client
 
         yield client
@@ -177,13 +177,15 @@ def broker_stage_messages(s3_mocked, produce_queue_mocked):
 
         file_path = s3_storage.write(
             _file,
-            s3_storage.QUARANTINE,
-            file_name
+            s3_storage.PERM,
+            file_name,
+            config.DUMMY_VALUES['account'],
+            'curl/7.61.1'
         )
 
         values = {
-            'account': app.DUMMY_VALUES['account'],
-            'principal': app.DUMMY_VALUES['principal'],
+            'account': config.DUMMY_VALUES['account'],
+            'principal': config.DUMMY_VALUES['principal'],
             'validation': validation,
             'payload_id': file_name,
             'size': 100,

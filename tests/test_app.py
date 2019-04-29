@@ -6,7 +6,6 @@ import sh
 
 import pytest
 import requests
-import responses
 from tornado.httpclient import AsyncHTTPClient, HTTPClientError
 from tornado.testing import AsyncHTTPTestCase, gen_test
 from unittest import TestCase
@@ -14,6 +13,7 @@ from re import search
 from kafkahelpers import ReconnectingClient
 
 import app
+from utils import config
 from tests.fixtures.fake_mq import FakeMQ
 from tests.fixtures import StopLoopException
 from utils.storage import s3 as s3_storage
@@ -23,7 +23,7 @@ client = AsyncHTTPClient()
 
 
 def cleanup():
-    sh.rm(app.TOPIC_CONFIG)
+    sh.rm(config.TOPIC_CONFIG)
 
 
 class TestContentRegex(TestCase):
@@ -50,7 +50,6 @@ class TestContentRegex(TestCase):
         An invalid MIME type is correctly recognized.
         """
         mime_types = [
-            'application/vnd.redhat.insights.advisor+tbz2',
             'application/vnd.redhat.compliance+tgz',
             'application/vnd.redhat.my_app.service+zip',
             'text/vnd.redhat.insights.advisor+tgz',
@@ -62,8 +61,8 @@ class TestContentRegex(TestCase):
                 self.assertIsNone(search(app.content_regex, mime_type))
 
     def test_supports_legacy(self):
-        self.assertEqual("advisor", app.get_service("application/x-gzip; charset=binary"))
-        self.assertEqual("fab", app.get_service("application/vnd.redhat.fab.service+tgz"))
+        self.assertEqual({"service": "advisor", "category": "upload"}, app.get_service("application/x-gzip; charset=binary"))
+        self.assertEqual({"service": "fab", "category": "service"}, app.get_service("application/vnd.redhat.fab.service+tgz"))
 
 
 class TestUploadHandler(AsyncHTTPTestCase):
@@ -74,7 +73,7 @@ class TestUploadHandler(AsyncHTTPTestCase):
 
         # Build HTTP Request so that Tornado can recognize and use the payload test
         request = requests.Request(
-            url="http://localhost:8888/r/insights/platform/upload/api/v1/upload", data={},
+            url="http://localhost:8888/api/ingress/v1/upload", data={},
             files={file_field_name: (file_name, io.BytesIO(os.urandom(file_size)), mime_type)} if file_name else None,
         )
         request.headers["x-rh-insights-request-id"] = "test"
@@ -86,27 +85,27 @@ class TestUploadHandler(AsyncHTTPTestCase):
 
     @gen_test
     def test_root_get(self):
-        response = yield self.http_client.fetch(self.get_url('/r/insights/platform/upload'), method='GET')
+        response = yield self.http_client.fetch(self.get_url('/api/ingress'), method='GET')
         self.assertEqual(response.code, 200)
         self.assertEqual(response.body, b'boop')
-        response = yield self.http_client.fetch(self.get_url('/r/insights/platform/upload'), method='OPTIONS')
+        response = yield self.http_client.fetch(self.get_url('/api/ingress'), method='OPTIONS')
         self.assertEqual(response.headers['Allow'], 'GET, HEAD, OPTIONS')
 
     @gen_test
     def test_upload_get(self):
-        response = yield self.http_client.fetch(self.get_url('/r/insights/platform/upload/api/v1/upload'), method='GET')
+        response = yield self.http_client.fetch(self.get_url('/api/ingress/v1/upload'), method='GET')
         self.assertEqual(response.body, b"Accepted Content-Types: gzipped tarfile, zip file")
 
     @gen_test
     def test_upload_allowed_methods(self):
-        response = yield self.http_client.fetch(self.get_url('/r/insights/platform/upload/api/v1/upload'), method='OPTIONS')
+        response = yield self.http_client.fetch(self.get_url('/api/ingress/v1/upload'), method='OPTIONS')
         self.assertEqual(response.headers['Allow'], 'GET, POST, HEAD, OPTIONS')
 
     @gen_test
     def test_upload_post(self):
         request_context = self.prepare_request_context(100, 'payload.tar.gz')
         response = yield self.http_client.fetch(
-            self.get_url('/r/insights/platform/upload/api/v1/upload'),
+            self.get_url('/api/ingress/v1/upload'),
             method='POST',
             body=request_context.body,
             headers=request_context.headers
@@ -116,17 +115,17 @@ class TestUploadHandler(AsyncHTTPTestCase):
 
     @gen_test
     def test_version(self):
-        response = yield self.http_client.fetch(self.get_url('/r/insights/platform/upload/api/v1/version'), method='GET')
+        response = yield self.http_client.fetch(self.get_url('/api/ingress/v1/version'), method='GET')
         self.assertEqual(response.code, 200)
         self.assertEqual(response.body, b'{"commit": "8d06f664a88253c361e61af5a4fa2ac527bb5f46", "date": "2019-03-11T19:06:36Z"}')
 
     @gen_test
     def test_upload_post_file_too_large(self):
-        request_context = self.prepare_request_context(app.MAX_LENGTH + 1, 'payload.tar.gz')
+        request_context = self.prepare_request_context(config.MAX_LENGTH + 1, 'payload.tar.gz')
 
         with self.assertRaises(HTTPClientError) as response:
             yield self.http_client.fetch(
-                self.get_url('/r/insights/platform/upload/api/v1/upload'),
+                self.get_url('/api/ingress/v1/upload'),
                 method='POST',
                 body=request_context.body,
                 headers=request_context.headers
@@ -136,7 +135,7 @@ class TestUploadHandler(AsyncHTTPTestCase):
         self.assertEqual(
             'Payload too large: {content_length}. Should not exceed {max_length} bytes'.format(
                 content_length=str(request_context.headers.get('Content-Length')),
-                max_length=str(app.MAX_LENGTH)
+                max_length=str(config.MAX_LENGTH)
             ), response.exception.message
         )
 
@@ -146,7 +145,7 @@ class TestUploadHandler(AsyncHTTPTestCase):
 
         with self.assertRaises(HTTPClientError) as response:
             yield self.http_client.fetch(
-                self.get_url('/r/insights/platform/upload/api/v1/upload'),
+                self.get_url('/api/ingress/v1/upload'),
                 method='POST',
                 body=request_context.body,
                 headers=request_context.headers
@@ -161,7 +160,7 @@ class TestUploadHandler(AsyncHTTPTestCase):
 
         with self.assertRaises(HTTPClientError) as response:
             yield self.http_client.fetch(
-                self.get_url('/r/insights/platform/upload/api/v1/upload'),
+                self.get_url('/api/ingress/v1/upload'),
                 method='POST',
                 body=request_context.body,
                 headers=request_context.headers
@@ -176,7 +175,7 @@ class TestUploadHandler(AsyncHTTPTestCase):
 
         with self.assertRaises(HTTPClientError) as response:
             yield self.http_client.fetch(
-                self.get_url('/r/insights/platform/upload/api/v1/upload'),
+                self.get_url('/api/ingress/v1/upload'),
                 method='POST',
                 body=request_context.body,
                 headers=request_context.headers
@@ -184,39 +183,6 @@ class TestUploadHandler(AsyncHTTPTestCase):
 
         self.assertEqual(response.exception.code, 415)
         self.assertEqual(response.exception.message, 'Unsupported MIME type')
-
-
-class TestInventoryPost(object):
-
-    @responses.activate
-    @patch("app.INVENTORY_URL", "http://fakeinventory.com/r/insights/platform/inventory/api/v1/hosts")
-    def test_post_to_inventory_success(self):
-        values = {"account": "12345", "metadata": {"some_key": "some_value"}}
-        responses.add(responses.POST, app.INVENTORY_URL,
-                      json={"data": [{"host": {"id": "4f81c749-e6e6-46a7-ba3f-e755001ba5ee"}, "status": 200}]}, status=207)
-        method_response = app.post_to_inventory('1234', 'abcd1234', values)
-
-        assert method_response == "4f81c749-e6e6-46a7-ba3f-e755001ba5ee"
-        assert len(responses.calls) == 1
-        assert responses.calls[0].response.text == '{"data": [{"host": {"id": "4f81c749-e6e6-46a7-ba3f-e755001ba5ee"}, "status": 200}]}'
-
-    @responses.activate
-    @patch("app.INVENTORY_URL", "http://fakeinventory.com/r/insights/platform/inventory/api/v1/hosts")
-    def test_post_to_inventory_fail(self):
-        values = {"account": "12345", "metadata": {"bad_key": "bad_value"}}
-        responses.add(responses.POST, app.INVENTORY_URL,
-                      json={"data": [{"detail": "boop", "status": 400}]}, status=207)
-        method_response = app.post_to_inventory('1234', 'abcd1234', values)
-
-        assert method_response is None
-        assert len(responses.calls) == 1
-        assert responses.calls[0].response.text == '{"data": [{"detail": "boop", "status": 400}]}'
-
-    def test_strip_empty_key_before_post_to_inventory(self):
-        values = {"account": "12345", "metadata": {"empty_key": [], "non_empty_key": "non_empty_value"}}
-        stripped_metadata = app.strip_empty_facts(values["metadata"])
-
-        assert stripped_metadata == {'non_empty_key': 'non_empty_value'}
 
 
 class TestProducerAndConsumer:
@@ -267,7 +233,7 @@ class TestProducerAndConsumer:
                 produced_messages.append(message)
 
             for m in produced_messages:
-                assert s3_storage.ls(s3_storage.QUARANTINE, m['payload_id'])['ResponseMetadata']['HTTPStatusCode'] == 200
+                assert s3_storage.ls(s3_storage.PERM, m['payload_id'])['ResponseMetadata']['HTTPStatusCode'] == 200
 
             assert mq.produce_calls_count == total_messages
             assert mq.count_topic_messages(topic) == total_messages
@@ -277,7 +243,6 @@ class TestProducerAndConsumer:
             event_loop.run_until_complete(self.coroutine_test(consumer))
 
             for m in produced_messages:
-                assert s3_storage.ls(s3_storage.QUARANTINE, m['payload_id'])['ResponseMetadata']['HTTPStatusCode'] == 404
                 assert s3_storage.ls(s3_storage.PERM, m['payload_id'])['ResponseMetadata']['HTTPStatusCode'] == 200
 
             assert mq.consume_calls_count > 0
@@ -313,7 +278,7 @@ class TestProducerAndConsumer:
             event_loop.run_until_complete(self.coroutine_test(consumer))
 
             for m in produced_messages:
-                assert s3_storage.ls(s3_storage.QUARANTINE, m['payload_id'])['ResponseMetadata']['HTTPStatusCode'] == 404
+                assert s3_storage.ls(s3_storage.PERM, m['payload_id'])['ResponseMetadata']['HTTPStatusCode'] == 404
                 assert s3_storage.ls(s3_storage.REJECT, m['payload_id'])['ResponseMetadata']['HTTPStatusCode'] == 200
 
             assert mq.consume_calls_count > 0
@@ -356,7 +321,7 @@ class TestProducerAndConsumer:
             assert mq.trying_to_connect_failures_calls == 0
             assert len(app.produce_queue) == 0
 
-    @patch("app.RETRY_INTERVAL", 0.01)
+    @patch("utils.config.RETRY_INTERVAL", 0.01)
     def test_producer_with_connection_issues(self, local_file, s3_mocked, broker_stage_messages, event_loop):
 
         total_messages = 4
@@ -375,7 +340,7 @@ class TestProducerAndConsumer:
             assert mq.disconnect_in_operation_called is True
             assert mq.trying_to_connect_failures_calls == 1
 
-    @patch("app.RETRY_INTERVAL", 0.01)
+    @patch("utils.config.RETRY_INTERVAL", 0.01)
     def test_consumer_with_connection_issues(self, local_file, s3_mocked, broker_stage_messages, event_loop):
 
         total_messages = 4

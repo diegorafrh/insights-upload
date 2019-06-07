@@ -25,9 +25,9 @@ MAX_WORKERS = int(os.getenv('MAX_WORKERS', 50))
 # Maximum time to wait for an archive to upload to storage
 STORAGE_UPLOAD_TIMEOUT = int(os.getenv('STORAGE_UPLOAD_TIMEOUT', 60))
 
-DEVMODE = os.getenv('DEV', False)
-
 VALIDATION_QUEUE = os.getenv('VALIDATION_QUEUE', 'platform.upload.validation')
+
+INVENTORY_URL = os.getenv('INVENTORY_URL', 'http://inventory:8080/api/hosts')
 
 STORAGE_DRIVER = os.getenv("STORAGE_DRIVER", "s3")
 
@@ -42,7 +42,9 @@ MQ_GROUP_ID = os.getenv('MQ_GROUP_ID', 'upload')
 BUILD_ID = os.getenv('OPENSHIFT_BUILD_COMMIT', '8d06f664a88253c361e61af5a4fa2ac527bb5f46')
 
 TOPIC_CONFIG = os.getenv('TOPIC_CONFIG', '/tmp/topics.json')
+MAX_RECORDS = int(os.getenv("MAX_RECORDS", 1))
 
+LOG_GROUP = os.getenv("LOG_GROUP", "platform")
 
 # Items in this map are _special cases_ where the service cannot be extracted
 # from the Content-Type
@@ -97,14 +99,24 @@ def get_namespace():
 
 def get_valid_topics():
     VALID_TOPICS = []
-    with open(TOPIC_CONFIG, 'r') as f:
-        data = f.read().replace("'", '"')
-        topic_config = json.loads(data)
+    try:
+        with open(TOPIC_CONFIG, 'r') as f:
+            data = f.read().replace("'", '"')
+            topic_config = json.loads(data)
 
-    for topic in topic_config:
-        for name in topic['TOPIC_NAME'].split('.'):
+        for topic in topic_config:
+            name = topic['TOPIC_NAME'].split('.')[-1]
             VALID_TOPICS.append(name)
-    return VALID_TOPICS
+        return VALID_TOPICS
+    except Exception:
+        logger.exception("Unable to open topics.json. Using default topics")
+        VALID_TOPICS = ["advisor",
+                        "validation",
+                        "testareno",
+                        "hccm",
+                        "compliance",
+                        "qpc"]
+        return VALID_TOPICS
 
 
 def get_commit_date(commit_id):
@@ -113,6 +125,14 @@ def get_commit_date(commit_id):
     else:
         headers = {}
     BASE_URL = "https://api.github.com/repos/RedHatInsights/insights-upload/git/commits/"
-    response = requests.get(BASE_URL + commit_id, headers=headers)
-    date = response.json()['committer']['date']
+    try:
+        response = requests.get(BASE_URL + commit_id, headers=headers)
+        date = response.json()['committer']['date']
+    except Exception:
+        logger.exception("Unable to get commit date")
+        date = "unknown"
+
     return date
+
+
+VALID_TOPICS = get_valid_topics()

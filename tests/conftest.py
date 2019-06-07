@@ -63,21 +63,8 @@ def s3_mocked():
 
 @pytest.fixture
 def local_file():
-    """
-    Allocate file in /var/tmp
-    """
-    file_path = "/tmp/insights.tar.gz"
-    try:
-        sh.rm(file_path)
-    except Exception:
-        pass
 
-    with open(file_path, "wb") as fp:
-        fp.write(b"0" * 100)
-
-    yield file_path
-
-    sh.rm(file_path)
+    yield b"0" * 100
 
 
 @pytest.fixture
@@ -187,7 +174,7 @@ def broker_stage_messages(s3_mocked, produce_queue_mocked):
             'account': config.DUMMY_VALUES['account'],
             'principal': config.DUMMY_VALUES['principal'],
             'validation': validation,
-            'payload_id': file_name,
+            'request_id': file_name,
             'size': 100,
             'service': service,
             'url': file_path

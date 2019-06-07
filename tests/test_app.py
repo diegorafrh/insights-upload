@@ -6,6 +6,7 @@ import sh
 
 import pytest
 import requests
+import responses
 from tornado.httpclient import AsyncHTTPClient, HTTPClientError
 from tornado.testing import AsyncHTTPTestCase, gen_test
 from unittest import TestCase
@@ -185,6 +186,47 @@ class TestUploadHandler(AsyncHTTPTestCase):
         self.assertEqual(response.exception.message, 'Unsupported MIME type')
 
 
+class TestInventoryPost(object):
+
+    @asyncio.coroutine
+    @responses.activate
+    @patch("utils.config.INVENTORY_URL", "http://fakeinventory.com/api/inventory/v1/hosts")
+    def test_post_to_inventory_success(self):
+        values = {"account": "12345", "metadata": {"some_key": "some_value"}}
+        responses.add(responses.POST, config.INVENTORY_URL,
+                      json={"data": [{"host": {"id": "4f81c749-e6e6-46a7-ba3f-e755001ba5ee"}, "status": 200}]}, status=207)
+        method_response = app.post_to_inventory('1234', 'abcd1234', values)
+
+        assert method_response == "4f81c749-e6e6-46a7-ba3f-e755001ba5ee"
+        assert len(responses.calls) == 1
+        assert responses.calls[0].response.text == '{"data": [{"host": {"id": "4f81c749-e6e6-46a7-ba3f-e755001ba5ee"}, "status": 200}]}'
+
+    @asyncio.coroutine
+    @responses.activate
+    @patch("utils.config.INVENTORY_URL", "http://fakeinventory.com/api/inventory/v1/hosts")
+    def test_post_to_inventory_fail(self):
+        values = {"account": "12345", "metadata": {"bad_key": "bad_value"}}
+        responses.add(responses.POST, config.INVENTORY_URL,
+                      json={"data": [{"detail": "boop", "status": 400}]}, status=207)
+        method_response = app.post_to_inventory('1234', 'abcd1234', values)
+
+        assert method_response is None
+        assert len(responses.calls) == 1
+        assert responses.calls[0].response.text == '{"data": [{"detail": "boop", "status": 400}]}'
+
+    def test_strip_empty_key_before_post_to_inventory(self):
+        values = {"account": "12345", "metadata": {"empty_key": [], "non_empty_key": "non_empty_value"}}
+        stripped_metadata = app.prepare_facts_for_inventory(values["metadata"])
+
+        assert stripped_metadata == {'non_empty_key': 'non_empty_value'}
+
+    def test_strip_invalid_display_name_small(self):
+        values = {"account": "12345", "metadata": {"display_name": "a", "non_empty_key": "non_empty_value"}}
+        stripped_metadata = app.prepare_facts_for_inventory(values["metadata"])
+
+        assert stripped_metadata == {'non_empty_key': 'non_empty_value'}
+
+
 class TestProducerAndConsumer:
 
     @staticmethod
@@ -199,6 +241,7 @@ class TestProducerAndConsumer:
 
         assert str(e.value) == exc_message
 
+    @asyncio.coroutine
     def test_producer_with_s3_bucket(self, local_file, s3_mocked, broker_stage_messages, event_loop):
         total_messages = 4
         [self._create_message_s3(local_file, broker_stage_messages) for _ in range(total_messages)]
@@ -233,7 +276,7 @@ class TestProducerAndConsumer:
                 produced_messages.append(message)
 
             for m in produced_messages:
-                assert s3_storage.ls(s3_storage.PERM, m['payload_id'])['ResponseMetadata']['HTTPStatusCode'] == 200
+                assert s3_storage.ls(s3_storage.PERM, m['request_id'])['ResponseMetadata']['HTTPStatusCode'] == 200
 
             assert mq.produce_calls_count == total_messages
             assert mq.count_topic_messages(topic) == total_messages
@@ -243,7 +286,7 @@ class TestProducerAndConsumer:
             event_loop.run_until_complete(self.coroutine_test(consumer))
 
             for m in produced_messages:
-                assert s3_storage.ls(s3_storage.PERM, m['payload_id'])['ResponseMetadata']['HTTPStatusCode'] == 200
+                assert s3_storage.ls(s3_storage.PERM, m['request_id'])['ResponseMetadata']['HTTPStatusCode'] == 200
 
             assert mq.consume_calls_count > 0
             assert mq.consume_return_messages_count == 1
@@ -278,8 +321,8 @@ class TestProducerAndConsumer:
             event_loop.run_until_complete(self.coroutine_test(consumer))
 
             for m in produced_messages:
-                assert s3_storage.ls(s3_storage.PERM, m['payload_id'])['ResponseMetadata']['HTTPStatusCode'] == 404
-                assert s3_storage.ls(s3_storage.REJECT, m['payload_id'])['ResponseMetadata']['HTTPStatusCode'] == 200
+                assert s3_storage.ls(s3_storage.PERM, m['request_id'])['ResponseMetadata']['HTTPStatusCode'] == 404
+                assert s3_storage.ls(s3_storage.REJECT, m['request_id'])['ResponseMetadata']['HTTPStatusCode'] == 200
 
             assert mq.consume_calls_count > 0
             assert mq.consume_return_messages_count == 1
@@ -321,6 +364,7 @@ class TestProducerAndConsumer:
             assert mq.trying_to_connect_failures_calls == 0
             assert len(app.produce_queue) == 0
 
+    @asyncio.coroutine
     @patch("utils.config.RETRY_INTERVAL", 0.01)
     def test_producer_with_connection_issues(self, local_file, s3_mocked, broker_stage_messages, event_loop):
 

@@ -13,11 +13,11 @@ def stage():
         os.makedirs(dir_, exist_ok=True)
 
 
-def write(data, dest, uuid):
+def write(data, dest, uuid, account, user_agent):
     dir_path = os.path.join(WORKDIR, dest)
     if dir_path in dirs and not os.path.isdir(dir_path):
         stage()
-    with open(os.path.join(dir_path, uuid), 'w') as f:
+    with open(os.path.join(dir_path, uuid), 'wb') as f:
         f.write(data)
         url = f
     return url.name
@@ -32,3 +32,7 @@ def copy(src, dest, uuid):
     os.rename(os.path.join(WORKDIR, src, uuid),
               os.path.join(WORKDIR, dest, uuid))
     return os.path.join(WORKDIR, dest, uuid)
+
+
+def get_url(bucket, uuid):
+    return "file://" + os.path.join(WORKDIR, bucket, uuid)

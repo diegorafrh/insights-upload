@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import collections
 import json
 import logging
@@ -15,7 +16,6 @@ from importlib import import_module
 from tempfile import NamedTemporaryFile
 from time import time, sleep
 
-import tornado.ioloop
 import tornado.web
 from tornado.httpclient import AsyncHTTPClient, HTTPClientError
 from tornado.ioloop import IOLoop
